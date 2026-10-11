@@ -8,16 +8,19 @@ import pandas as pd
 import pytest
 
 from src.data import (
+    build_etf_daily,
     build_month_end,
     build_monthly_avg,
     check_monthly_continuity,
     current_us_month,
+    daily_rf,
     find_partial_month_notes,
     find_shiller_url,
     parse_french_rf,
     parse_shiller,
     parse_shiller_date,
     parse_yahoo,
+    parse_yahoo_dividends,
     record_manifest,
     total_return,
 )
@@ -116,6 +119,57 @@ def test_parse_yahoo_rejects_midnight_utc_timestamps():
 def test_parse_yahoo_rejects_unexpected_format():
     with pytest.raises(ValueError):
         parse_yahoo({"chart": {"result": None, "error": {"code": "Not Found"}}})
+
+
+def yahoo_ts(day: str) -> int:
+    """뉴욕 09:30 (UTC 13:30, 여름 시간 기준)의 타임스탬프."""
+    return int(pd.Timestamp(f"{day} 13:30", tz="UTC").timestamp())
+
+
+def test_parse_yahoo_dividends():
+    data = {"chart": {"result": [{"events": {"dividends": {
+        "b": {"amount": 1.5, "date": yahoo_ts("2026-09-18")},
+        "a": {"amount": 1.2, "date": yahoo_ts("2026-06-19")},
+    }}}]}}
+    dividends = parse_yahoo_dividends(data)
+    assert list(dividends.index.strftime("%Y-%m-%d")) == ["2026-06-19", "2026-09-18"]
+    assert list(dividends) == [1.2, 1.5]
+
+
+def test_parse_yahoo_dividends_rejects_splits():
+    data = {"chart": {"result": [{"events": {"splits": {"x": {"date": yahoo_ts("2026-06-19")}}}}]}}
+    with pytest.raises(ValueError, match="분할"):
+        parse_yahoo_dividends(data)
+
+
+def test_daily_rf_compounds_to_monthly_rf():
+    index = pd.bdate_range("2026-08-03", "2026-09-30")  # 8월 21일, 9월 22일
+    rf_monthly = pd.Series([0.003, 0.004], index=months("2026-08", 2))
+    rf = daily_rf(index, rf_monthly, current_month=pd.Period("2026-09", freq="M"))
+    august = rf[rf.index.month == 8]
+    assert (1 + august).prod() - 1 == pytest.approx(0.003)
+    # 끝나지 않은 달(9월)은 거래일 수를 모르므로 NaN
+    assert rf[rf.index.month == 9].isna().all()
+
+
+def test_build_etf_daily_total_return_on_ex_date():
+    close = pd.Series([100.0, 99.0, 101.0], index=pd.DatetimeIndex(["2026-06-17", "2026-06-18", "2026-06-19"]))
+    dividends = pd.Series([1.5], index=pd.DatetimeIndex(["2026-06-18"]))
+    rf_monthly = pd.Series([0.003], index=months("2026-06", 1))
+    df = build_etf_daily(close, dividends, rf_monthly, current_month=pd.Period("2026-10", freq="M"))
+    assert list(df["dividend"]) == [0.0, 1.5, 0.0]
+    # 배당락일: (99 + 1.5) / 100 - 1 = 0.005
+    assert df["total_return"].iloc[1] == pytest.approx(0.005)
+    assert df["price_return"].iloc[1] == pytest.approx(-0.01)
+    assert df["total_return"].iloc[2] == pytest.approx(101.0 / 99.0 - 1)
+
+
+def test_build_etf_daily_rejects_dividend_on_non_trading_day():
+    close = pd.Series([100.0, 99.0], index=pd.DatetimeIndex(["2026-06-17", "2026-06-18"]))
+    dividends = pd.Series([1.5], index=pd.DatetimeIndex(["2026-06-20"]))
+    rf_monthly = pd.Series([0.003], index=months("2026-06", 1))
+    with pytest.raises(ValueError, match="배당락일"):
+        build_etf_daily(close, dividends, rf_monthly, current_month=pd.Period("2026-10", freq="M"))
 
 
 FRENCH_TEXT = """This file was created using the 202608 CRSP database.

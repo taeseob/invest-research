@@ -1,6 +1,7 @@
 """시세 데이터 수집과 정리.
 
 - Yahoo: S&P 500 일별 종가 (^GSPC, 1927-12-30부터). 월말 종가는 여기서 만듭니다.
+- Yahoo: SPY 일별 종가와 배당 (1993-01-29부터), S&P 500 총수익 지수 (^SP500TR, 1988년부터, 교차 확인용)
 - Shiller: S&P 500 월간 배당과 월평균 가격 (shillerdata.com, 1871년부터)
 - Ken French: 1개월 국채 월 수익률 RF (1926-07부터)
 
@@ -26,8 +27,10 @@ MANIFEST_PATH = RAW_DIR / "manifest.json"
 
 SHILLER_PAGE = "https://shillerdata.com/"
 # 예전 주소(econ.yale.edu)는 2023년 10월 이후 갱신되지 않으므로 쓰지 않습니다.
-YAHOO_CHART = "https://query1.finance.yahoo.com/v8/finance/chart/%5EGSPC"
-YAHOO_START = -1325583000  # 1927-12-30, Yahoo가 밝힌 ^GSPC 첫 거래일
+YAHOO_CHART = "https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
+YAHOO_START = -1325583000  # 1927-12-30, Yahoo가 밝힌 ^GSPC 첫 거래일. 이보다 늦게 시작하는 종목은 첫 거래일부터 옵니다.
+# Yahoo 종목 기호와 원본 파일 이름
+YAHOO_SYMBOLS = {"^GSPC": "yahoo_gspc.json", "SPY": "yahoo_spy.json", "^SP500TR": "yahoo_sp500tr.json"}
 FRENCH_FACTORS = "https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/ftp/F-F_Research_Data_Factors_CSV.zip"
 
 US_MARKET_TZ = ZoneInfo("America/New_York")
@@ -77,15 +80,20 @@ def download_shiller(path: Path = RAW_DIR / "shiller_ie_data.xls") -> Path:
     return download(find_shiller_url(page.text), path)
 
 
-def download_yahoo(path: Path = RAW_DIR / "yahoo_gspc.json") -> Path:
-    # Yahoo는 공식 API가 없습니다. 형식이 바뀌거나 막히면 parse_yahoo에서 오류가 납니다.
+def download_yahoo(symbol: str) -> Path:
+    """일별 시세와 배당·분할 기록을 받습니다.
+
+    Yahoo는 공식 API가 없습니다. 형식이 바뀌거나 막히면 parse_yahoo에서 오류가 납니다.
+    """
     params = {
         "period1": YAHOO_START,
         "period2": int(datetime.now(timezone.utc).timestamp()),
         "interval": "1d",
-        "includeAdjustedClose": "false",
+        "events": "div|split",
+        "includeAdjustedClose": "true",
     }
-    return download(YAHOO_CHART, path, params=params, headers={"User-Agent": "Mozilla/5.0"})
+    url = YAHOO_CHART.format(symbol=requests.utils.quote(symbol, safe=""))
+    return download(url, RAW_DIR / YAHOO_SYMBOLS[symbol], params=params, headers={"User-Agent": "Mozilla/5.0"})
 
 
 def download_french(path: Path = RAW_DIR / "french_factors.zip") -> Path:
@@ -166,8 +174,20 @@ def parse_shiller(raw: pd.DataFrame) -> pd.DataFrame:
     return body
 
 
+def yahoo_dates(timestamps) -> pd.DatetimeIndex:
+    """Yahoo 타임스탬프를 미국 동부 날짜로 바꿉니다."""
+    local = pd.to_datetime(timestamps, unit="s", utc=True).tz_convert(US_MARKET_TZ)
+    # 시각이 장중이 아니거나 주말이면 날짜가 하루 밀렸을 수 있으므로 멈춥니다.
+    if ((local.hour < 9) | (local.hour > 16) | (local.dayofweek >= 5)).any():
+        raise ValueError("Yahoo 시각이 뉴욕 장중 평일이 아닌 행이 있습니다. 날짜 변환을 확인하세요.")
+    return local.tz_localize(None).normalize()
+
+
 def parse_yahoo(data: dict) -> pd.Series:
-    """Yahoo 차트 응답을 미국 동부 날짜 기준 일별 종가 Series로 바꿉니다."""
+    """Yahoo 차트 응답을 미국 동부 날짜 기준 일별 종가 Series로 바꿉니다.
+
+    Yahoo의 close는 분할만 반영하고 배당은 반영하지 않은 가격입니다.
+    """
     try:
         result = data["chart"]["result"][0]
         timestamps = result["timestamp"]
@@ -175,17 +195,56 @@ def parse_yahoo(data: dict) -> pd.Series:
     except (KeyError, IndexError, TypeError) as error:
         raise ValueError("Yahoo 응답 형식이 예상과 다릅니다.") from error
 
-    local = pd.to_datetime(timestamps, unit="s", utc=True).tz_convert(US_MARKET_TZ)
-    # 시각이 장중이 아니거나 주말이면 날짜가 하루 밀렸을 수 있으므로 멈춥니다.
-    if ((local.hour < 9) | (local.hour > 16) | (local.dayofweek >= 5)).any():
-        raise ValueError("Yahoo 시각이 뉴욕 장중 평일이 아닌 행이 있습니다. 날짜 변환을 확인하세요.")
-    days = local.tz_localize(None).normalize()
-    close = pd.Series(closes, index=days, name="close", dtype="float64").dropna()
+    close = pd.Series(closes, index=yahoo_dates(timestamps), name="close", dtype="float64").dropna()
     close = close[~close.index.duplicated(keep="last")].sort_index()
     close.index.name = "date"
     if (close <= 0).any():
         raise ValueError("Yahoo 종가에 0 이하 값이 있습니다.")
     return close
+
+
+def parse_yahoo_dividends(data: dict) -> pd.Series:
+    """Yahoo 배당 기록(배당락일 기준, 주당 금액)을 꺼냅니다.
+
+    분할 기록이 있으면 멈춥니다. 분할이 있는 종목은 배당과 가격의 기준을 맞추는 처리가 따로 필요합니다.
+    """
+    events = data["chart"]["result"][0].get("events", {})
+    if events.get("splits"):
+        raise ValueError("분할 기록이 있습니다. 분할 처리를 넣기 전에는 이 종목을 쓰지 않습니다.")
+    records = sorted(events.get("dividends", {}).values(), key=lambda r: r["date"])
+    dividends = pd.Series(
+        [r["amount"] for r in records], index=yahoo_dates([r["date"] for r in records]), name="dividend", dtype="float64"
+    )
+    dividends.index.name = "date"
+    if not dividends.index.is_unique:
+        raise ValueError("같은 날 배당 기록이 둘 이상입니다.")
+    return dividends
+
+
+def daily_rf(index: pd.DatetimeIndex, rf_monthly: pd.Series, current_month: pd.Period) -> pd.Series:
+    """월간 RF를 그 달 거래일 수로 기하 분할한 일별 수익률.
+
+    그 달 거래일 수는 월말에야 알 수 있지만, 매매 결정에는 쓰이지 않습니다.
+    끝나지 않은 달은 거래일 수를 모르므로 NaN입니다.
+    """
+    months = index.to_period("M")
+    days_in_month = pd.Series(1, index=index).groupby(months).transform("size").to_numpy()
+    rf = (1 + rf_monthly.reindex(months).to_numpy()) ** (1 / days_in_month) - 1
+    rf[months >= current_month] = float("nan")
+    return pd.Series(rf, index=index, name="rf")
+
+
+def build_etf_daily(close: pd.Series, dividends: pd.Series, rf_monthly: pd.Series, current_month: pd.Period) -> pd.DataFrame:
+    """ETF 일별 표: 종가, 배당(세전, 배당락일), 가격 수익률, 배당 포함 수익률, 일별 RF."""
+    if not dividends.index.isin(close.index).all():
+        missing = dividends.index[~dividends.index.isin(close.index)]
+        raise ValueError(f"거래일이 아닌 배당락일이 있습니다: {list(missing.strftime('%Y-%m-%d'))[:5]}")
+    df = pd.DataFrame({"close": close})
+    df["dividend"] = dividends.reindex(df.index).fillna(0.0)
+    df["price_return"] = df["close"] / df["close"].shift(1) - 1
+    df["total_return"] = (df["close"] + df["dividend"]) / df["close"].shift(1) - 1
+    df["rf"] = daily_rf(df.index, rf_monthly, current_month)
+    return df
 
 
 def parse_french_rf(text: str) -> pd.Series:
@@ -265,32 +324,42 @@ def main(offline: bool = False) -> None:
     if offline:
         # 이미 받은 원본으로 표만 다시 만듭니다.
         shiller_path = RAW_DIR / "shiller_ie_data.xls"
-        yahoo_path = RAW_DIR / "yahoo_gspc.json"
+        yahoo_paths = {symbol: RAW_DIR / name for symbol, name in YAHOO_SYMBOLS.items()}
         french_path = RAW_DIR / "french_factors.zip"
     else:
         shiller_path = download_shiller()
-        yahoo_path = download_yahoo()
+        yahoo_paths = {symbol: download_yahoo(symbol) for symbol in YAHOO_SYMBOLS}
         french_path = download_french()
 
     shiller = parse_shiller(pd.read_excel(shiller_path, sheet_name="Data", header=None))
-    daily = parse_yahoo(json.loads(yahoo_path.read_text(encoding="utf-8")))
+    yahoo = {symbol: json.loads(path.read_text(encoding="utf-8")) for symbol, path in yahoo_paths.items()}
     rf = parse_french_rf(read_french_zip(french_path))
 
     if offline:
-        # 기준 시점은 Yahoo 원본을 내려받은 시각입니다.
+        # 기준 시점은 ^GSPC 원본을 내려받은 시각입니다.
         manifest = json.loads(MANIFEST_PATH.read_text(encoding="utf-8"))
-        now = datetime.fromisoformat(manifest[yahoo_path.name]["downloaded_at_utc"]).astimezone(US_MARKET_TZ)
+        now = datetime.fromisoformat(manifest[YAHOO_SYMBOLS["^GSPC"]]["downloaded_at_utc"]).astimezone(US_MARKET_TZ)
     else:
         now = datetime.now(US_MARKET_TZ)
     current_month = current_us_month(now)
-    daily = daily[daily.index.date < now.date()]  # 오늘은 장중일 수 있어 뺍니다.
+
+    def closed_days(close: pd.Series) -> pd.Series:
+        return close[close.index.date < now.date()]  # 오늘은 장중일 수 있어 뺍니다.
+
+    daily = closed_days(parse_yahoo(yahoo["^GSPC"]))
     month_end = build_month_end(daily, shiller, rf, current_month)
     monthly_avg = build_monthly_avg(shiller, rf, current_month)
+    spy = build_etf_daily(
+        closed_days(parse_yahoo(yahoo["SPY"])), parse_yahoo_dividends(yahoo["SPY"]), rf, current_month
+    )
+    sp500tr = closed_days(parse_yahoo(yahoo["^SP500TR"])).to_frame()
 
     outputs = {
         "sp500_daily.csv": daily.to_frame(),
         "sp500_month_end.csv": month_end,
         "sp500_monthly_avg.csv": monthly_avg,
+        "spy_daily.csv": spy,
+        "sp500tr_daily.csv": sp500tr,
     }
     for name, df in outputs.items():
         df.to_csv(DATA_DIR / name)
