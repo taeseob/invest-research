@@ -30,7 +30,7 @@ AI 코딩 에이전트(Claude Code)와 함께 연구 환경을 만들고 실험�
 | 3 | 모의 운용 6개월 | 신호를 규칙대로 100% 처리, 백테스트와의 차이를 설명 가능 |
 | 4 | 실전 소액 운용 | 규칙 준수와 성과를 1년 이상 확인 |
 
-**재현할 전략 (1단계)**
+**재현할 전략 (1단계)**: 규칙과 재현 계획은 [docs/phase1-strategies.md](docs/phase1-strategies.md)
 - 10개월 이동평균 전략: Meb Faber, "A Quantitative Approach to Tactical Asset Allocation"
 - 듀얼 모멘텀: Gary Antonacci, "Dual Momentum Investing"
 
