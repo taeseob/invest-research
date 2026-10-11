@@ -1,0 +1,34 @@
+# 비밀 정보 (API 키, 토큰)
+.env
+.env.*
+!.env.example
+
+# 내려받은 시세 데이터 (다시 받을 수 있고 용량이 큼)
+data/*
+!data/README.md
+
+# 개인 메모 (공개하지 않을 것)
+private/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.ipynb_checkpoints/
+*.egg-info/
+
+# 큰 결과 파일 (요약 표와 작은 차트만 reports/에 올림)
+reports/**/*.parquet
+reports/**/*.pkl
+reports/**/*.h5
+
+# 에디터, OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Claude Code 개인 설정
+.claude/settings.local.json
