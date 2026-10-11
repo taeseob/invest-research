@@ -8,11 +8,15 @@
 |---|---|
 | `raw/shiller_ie_data.xls` | Shiller S&P 500 월간 자료 원본 (shillerdata.com) |
 | `raw/yahoo_gspc.json` | Yahoo `^GSPC` 일별 시세 원본 (1927-12-30부터) |
+| `raw/yahoo_spy.json` | Yahoo SPY 일별 시세와 배당 원본 (1993-01-29부터) |
+| `raw/yahoo_sp500tr.json` | Yahoo `^SP500TR` 일별 시세 원본 (S&P 500 총수익 지수, 1988년부터) |
 | `raw/french_factors.zip` | Ken French 3요인 자료 원본 (RF: 1개월 국채 월 수익률, 1926-07부터) |
 | `raw/manifest.json` | 위 원본의 출처, 내려받은 시각(UTC), 크기, SHA256 |
 | `sp500_daily.csv` | S&P 500 일별 종가 (미국 동부 날짜) |
-| `sp500_month_end.csv` | **주 시험용.** 월말 종가, 배당(Shiller), 가격·총수익률, RF |
-| `sp500_monthly_avg.csv` | 보조 시험용. Shiller 월평균 가격, 배당, 총수익률, RF |
+| `sp500_month_end.csv` | **Faber 재현 주 시험용.** 월말 종가, 배당(Shiller), 가격·총수익률, RF |
+| `spy_daily.csv` | SPY 일별 종가, 배당(세전, 배당락일), 가격·배당 포함 수익률, 일별 RF (월간 RF를 그 달 거래일 수로 기하 분할) |
+| `sp500tr_daily.csv` | S&P 500 총수익 지수 일별 종가 (SPY 교차 확인용) |
+| `sp500_monthly_avg.csv` | Faber 재현 보조 시험용. Shiller 월평균 가격, 배당, 총수익률, RF |
 
 주의:
 

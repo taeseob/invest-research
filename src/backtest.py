@@ -23,11 +23,13 @@ class Costs:
     - trade: 편도 매매 비용 (수수료와 슬리피지). 사거나 팔 때마다 거래 금액에 대해 냅니다.
     - dividend_withholding: 배당 원천징수율
     - capital_gains_tax: 연간 실현 순이익에 매기는 양도소득세율. 같은 해 손실만 상계하고, 그해 마지막 거래일에 뺍니다.
+    - interest_tax: 현금 이자에 매기는 세율 (원천징수로 보고 매일 뺍니다)
     """
 
     trade: float = 0.001
     dividend_withholding: float = 0.0
     capital_gains_tax: float = 0.0
+    interest_tax: float = 0.0
 
 
 # ---------------------------------------------------------------- 신호
@@ -81,7 +83,7 @@ def holding_from_signal(signal: pd.Series, index: pd.DatetimeIndex, lag: int = 1
 @dataclass
 class Result:
     daily: pd.DataFrame  # equity(청산 전), ret, rf, holding(그날 수익률에 적용한 보유 상태), trade, tax
-    final_after_liquidation: float  # 기간 끝에 모두 팔고 세금까지 낸 뒤의 자산
+    final_after_liquidation: float  # 기간 끝에 모두 팔고 마지막 해 세금까지 정산한 뒤의 자산
     start_date: pd.Timestamp  # 평가 시작 전날 (자산 1.0 기준일)
     trades: int
 
@@ -133,22 +135,33 @@ def run_backtest(data: pd.DataFrame, holding_after_close: pd.Series, start: str,
         if in_stock:
             value = start_value * (close[i] + dividend[i]) / close[i - 1]
         else:
-            value = start_value * (1 + rf[i])
+            value = start_value * (1 + rf[i] * (1 - costs.interest_tax))
         value, in_stock, basis, realized, did_trade = _trade(value, in_stock, target[i] == 1.0, basis, realized, costs)
         trades += did_trade
         traded[i] = did_trade
-        if year_end[i] or i == n - 1:
+        # 마지막 날의 세금은 청산 손익과 합쳐 아래에서 한 번에 정산합니다.
+        if year_end[i] and i < n - 1:
             tax = costs.capital_gains_tax * max(0.0, realized)
+            realized = 0.0
+            if in_stock and tax > 0:
+                # 주식을 일부 팔아 세금을 낸 것으로 봅니다. 판 비율만큼 취득가를 줄이고,
+                # 그 부분의 이익은 다음 해 실현 이익으로 넘깁니다. (이 매도의 매매 비용은 무시)
+                sold = tax / value
+                realized = sold * (value - basis)
+                basis *= 1 - sold
             value -= tax
-            taxes[i], realized = tax, 0.0
+            taxes[i] = tax
         equity[i] = value
         ret[i] = value / start_value - 1
 
-    # 기간 끝 청산: 보유 중이면 팔고 그 이익에 세금을 냅니다.
+    # 기간 끝 정산: 보유 중이면 팔고, 그해 실현 손익과 청산 손익을 합쳐 한 번만 과세합니다.
+    # 일별 자산(equity)은 이 정산 전 값입니다. 전략과 단순 보유 모두 같은 기준입니다.
     final = equity[-1]
     if in_stock:
-        proceeds = final * (1 - costs.trade)
-        final = proceeds - costs.capital_gains_tax * max(0.0, proceeds - basis)
+        final *= 1 - costs.trade
+        realized += final - basis
+    final_tax = costs.capital_gains_tax * max(0.0, realized)
+    final -= final_tax
 
     daily = pd.DataFrame(
         {"equity": equity, "ret": ret, "rf": np.nan_to_num(rf), "holding": held, "trade": traded, "tax": taxes},

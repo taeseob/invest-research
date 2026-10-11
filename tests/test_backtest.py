@@ -136,6 +136,36 @@ def test_realized_gains_are_taxed_at_year_end_with_same_year_losses_offset():
     assert result.trades == 4
 
 
+def test_year_end_tax_paid_from_stock_reduces_basis():
+    index = pd.DatetimeIndex(["2020-12-28", "2020-12-29", "2020-12-30", "2020-12-31", "2021-01-04", "2021-01-05"])
+    data = pd.DataFrame({"close": [100.0, 120.0, 120.0, 120.0, 150.0, 150.0], "dividend": 0.0, "rf": 0.0}, index=index)
+    # 12-28 매수, 12-29 매도(+0.2 실현), 12-30 매수, 연말에 주식 보유 중 세금 납부, 01-04 매도
+    holding = pd.Series([1.0, 0.0, 1.0, 1.0, 0.0, 0.0], index=index)
+    result = run_backtest(data, holding, "2020-12-29", "2021-01-05", Costs(trade=0.0, capital_gains_tax=0.22))
+
+    tax_2020 = 0.22 * 0.2
+    assert result.daily.loc["2020-12-31", "tax"] == pytest.approx(tax_2020)
+    value = 1.2 - tax_2020
+    basis = 1.2 * (1 - tax_2020 / 1.2)  # 세금만큼 판 부분의 취득가를 뺌
+    value *= 150 / 120
+    assert result.final_after_liquidation == pytest.approx(value - 0.22 * (value - basis))
+
+
+def test_last_year_loss_offsets_liquidation_gain():
+    data = make_data([100.0, 80.0, 80.0, 100.0])
+    # 매수 → 손실 매도(-0.2) → 재매수 → 기간 끝 청산(+0.2): 같은 해라 순이익 0, 세금 0
+    holding = pd.Series([1.0, 0.0, 1.0, 1.0], index=data.index)
+    result = run_backtest(data, holding, data.index[1], data.index[-1], Costs(trade=0.0, capital_gains_tax=0.22))
+    assert result.final_after_liquidation == pytest.approx(1.0)
+
+
+def test_interest_tax_on_cash():
+    data = make_data([100.0, 50.0, 25.0], rf=0.001)
+    holding = pd.Series(0.0, index=data.index)
+    result = run_backtest(data, holding, data.index[1], data.index[-1], Costs(trade=0.0, interest_tax=0.154))
+    assert result.daily["equity"].iloc[-1] == pytest.approx((1 + 0.001 * 0.846) ** 2)
+
+
 def test_cash_earns_rf():
     data = make_data([100.0, 50.0, 25.0], rf=0.001)
     holding = pd.Series(0.0, index=data.index)
