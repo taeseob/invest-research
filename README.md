@@ -56,7 +56,16 @@ invest-research/
 
 ## 실행
 
-Python 3.12 기준입니다. 연구 환경은 1단계에서 구성하며, 구성되면 이 부분을 채웁니다.
+Python 3.12 기준입니다.
+
+```
+python -m venv .venv
+.venv\Scripts\activate          # macOS/Linux: source .venv/bin/activate
+pip install -r requirements.txt
+
+python -m src.data              # 데이터 수집 (data/에 저장)
+pytest                          # 테스트
+```
 
 ## 참고 자료
 
