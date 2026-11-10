@@ -59,6 +59,70 @@ def moving_average_signal(price: pd.Series, signal_days: pd.DatetimeIndex, windo
     return signal
 
 
+def period_bars(ohlc: pd.DataFrame, freq: str) -> pd.DataFrame:
+    """일봉을 기간 봉(고가, 저가, 종가)으로 묶습니다. 인덱스는 각 기간의 마지막 거래일입니다."""
+    grouped = ohlc.groupby(ohlc.index.to_period(freq))
+    bars = pd.DataFrame({"high": grouped["high"].max(), "low": grouped["low"].min(), "close": grouped["close"].last()})
+    bars.index = period_last_days(ohlc.index, freq)
+    return bars
+
+
+def wilder_adx(bars: pd.DataFrame, period: int = 14) -> pd.Series:
+    """Wilder ADX. 방향이 아니라 추세의 세기를 나타냅니다.
+
+    bars: high, low 열을 가진 봉 표. +DI와 −DI의 분모가 같은 TR 평활이라 DX에서 약분되므로, TR과 종가는 필요 없습니다.
+    각 값은 그 봉까지의 데이터로만 계산합니다. 첫 값은 2 * period번째 봉에 나오고, 그 전은 NaN입니다.
+    """
+    high, low = bars["high"].to_numpy(), bars["low"].to_numpy()
+    n = len(bars)
+    adx = np.full(n, np.nan)
+    if n >= 2 * period:
+        up, down = high[1:] - high[:-1], low[:-1] - low[1:]
+        plus_dm = np.where((up > down) & (up > 0), up, 0.0)
+        minus_dm = np.where((down > up) & (down > 0), down, 0.0)
+
+        # i번째 봉의 움직임은 plus_dm[i - 1]입니다. 첫 평활값은 앞 period개의 합입니다.
+        smooth_plus, smooth_minus = plus_dm[:period].sum(), minus_dm[:period].sum()
+        dx = np.zeros(n)
+        for i in range(period, n):
+            if i > period:
+                smooth_plus += plus_dm[i - 1] - smooth_plus / period
+                smooth_minus += minus_dm[i - 1] - smooth_minus / period
+            total = smooth_plus + smooth_minus
+            dx[i] = 100 * abs(smooth_plus - smooth_minus) / total if total > 0 else 0.0
+
+        adx[2 * period - 1] = dx[period : 2 * period].mean()
+        for i in range(2 * period, n):
+            adx[i] = (adx[i - 1] * (period - 1) + dx[i]) / period
+    return pd.Series(adx, index=bars.index, name="adx")
+
+
+def moving_average_adx_signal(
+    price: pd.Series, signal_days: pd.DatetimeIndex, window: int, adx: pd.Series, threshold: float
+) -> pd.Series:
+    """이동평균 신호에 ADX 진입 필터를 더합니다. 진입에만 쓰고 청산에는 쓰지 않습니다.
+
+    - 미보유: 종가 > 이동평균이고 ADX >= threshold이면 보유 (그 주에 조건을 보고 진입합니다)
+    - 보유: 종가 <= 이동평균이면 미보유
+    두 지표가 모두 준비되기 전은 NaN이고, 준비된 첫 주는 미보유에서 시작합니다.
+    """
+    above = moving_average_signal(price, signal_days, window)
+    adx_on_days = adx.reindex(signal_days)
+    ready = above.notna() & adx_on_days.notna()
+    if ready.any() and not ready[ready.idxmax() :].all():
+        raise ValueError("지표가 준비된 뒤에 비어 있는 신호 날짜가 있습니다.")
+
+    signal = pd.Series(np.nan, index=signal_days, name="signal")
+    state = 0.0
+    for day in signal_days[ready]:
+        if state == 1.0:
+            state = above[day]
+        elif above[day] == 1.0 and adx_on_days[day] >= threshold:
+            state = 1.0
+        signal[day] = state
+    return signal
+
+
 def holding_from_signal(signal: pd.Series, index: pd.DatetimeIndex, lag: int = 1) -> pd.Series:
     """신호를 각 거래일 종가 직후의 보유 상태로 바꿉니다.
 

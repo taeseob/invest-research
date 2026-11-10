@@ -4,8 +4,11 @@
 - Yahoo: SPY 일별 종가와 배당 (1993-01-29부터), S&P 500 총수익 지수 (^SP500TR, 1988년부터, 교차 확인용)
 - Shiller: S&P 500 월간 배당과 월평균 가격 (shillerdata.com, 1871년부터)
 - Ken French: 1개월 국채 월 수익률 RF (1926-07부터)
+- Yahoo: KOSPI 일별 시가, 고가, 저가, 종가 (^KS11, 1996-12-11부터), KODEX 200 종가와 분배금 (069500.KS, 교차 확인용)
+- OECD: 원화 CD 91일물 월평균 금리 (IR3TIB, 1996-01부터)
 
 실행: python -m src.data (원본으로 표만 다시 만들 때: python -m src.data --offline)
+KOSPI 표는 따로 만듭니다: python -m src.data --kospi (원본으로 다시 만들 때: --kospi --offline)
 원본은 data/raw/에 두고, 내려받은 시각과 SHA256을 data/raw/manifest.json에 남깁니다.
 """
 
@@ -32,8 +35,17 @@ YAHOO_START = -1325583000  # 1927-12-30, Yahoo가 밝힌 ^GSPC 첫 거래일. �
 # Yahoo 종목 기호와 원본 파일 이름
 YAHOO_SYMBOLS = {"^GSPC": "yahoo_gspc.json", "SPY": "yahoo_spy.json", "^SP500TR": "yahoo_sp500tr.json"}
 FRENCH_FACTORS = "https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/ftp/F-F_Research_Data_Factors_CSV.zip"
+# 미국 표와 따로 받으므로 YAHOO_SYMBOLS에 넣지 않습니다.
+YAHOO_KR_SYMBOLS = {"^KS11": "yahoo_ks11.json", "069500.KS": "yahoo_kodex200.json"}
+OECD_KR_RATE = (
+    "https://sdmx.oecd.org/public/rest/data/OECD.SDD.STES,DSD_STES@DF_FINMARK,4.0/KOR.M.IR3TIB.PA....."
+    "?startPeriod=1996-01&format=csvfilewithlabels"
+)
+# Yahoo의 KODEX 200은 2009-04 전이 대부분 비어 있습니다. 교차 확인은 설계용 기간 안에서만 합니다.
+KODEX200_RANGE = ("2009-06-01", "2012-12-31")
 
 US_MARKET_TZ = ZoneInfo("America/New_York")
+KR_MARKET_TZ = ZoneInfo("Asia/Seoul")
 TIMEOUT = 60
 # 지역 설정에 따라 strftime("%b")가 "10월"처럼 나올 수 있어 직접 둡니다.
 MONTH_ABBR = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
@@ -93,11 +105,16 @@ def download_yahoo(symbol: str) -> Path:
         "includeAdjustedClose": "true",
     }
     url = YAHOO_CHART.format(symbol=requests.utils.quote(symbol, safe=""))
-    return download(url, RAW_DIR / YAHOO_SYMBOLS[symbol], params=params, headers={"User-Agent": "Mozilla/5.0"})
+    name = {**YAHOO_SYMBOLS, **YAHOO_KR_SYMBOLS}[symbol]
+    return download(url, RAW_DIR / name, params=params, headers={"User-Agent": "Mozilla/5.0"})
 
 
 def download_french(path: Path = RAW_DIR / "french_factors.zip") -> Path:
     return download(FRENCH_FACTORS, path)
+
+
+def download_oecd_kr_rate(path: Path = RAW_DIR / "oecd_kor_ir3tib.csv") -> Path:
+    return download(OECD_KR_RATE, path, headers={"User-Agent": "Mozilla/5.0"})
 
 
 # ---------------------------------------------------------------- 정리
@@ -174,17 +191,17 @@ def parse_shiller(raw: pd.DataFrame) -> pd.DataFrame:
     return body
 
 
-def yahoo_dates(timestamps) -> pd.DatetimeIndex:
-    """Yahoo 타임스탬프를 미국 동부 날짜로 바꿉니다."""
-    local = pd.to_datetime(timestamps, unit="s", utc=True).tz_convert(US_MARKET_TZ)
+def yahoo_dates(timestamps, tz: ZoneInfo = US_MARKET_TZ) -> pd.DatetimeIndex:
+    """Yahoo 타임스탬프를 그 시장의 날짜로 바꿉니다."""
+    local = pd.to_datetime(timestamps, unit="s", utc=True).tz_convert(tz)
     # 시각이 장중이 아니거나 주말이면 날짜가 하루 밀렸을 수 있으므로 멈춥니다.
     if ((local.hour < 9) | (local.hour > 16) | (local.dayofweek >= 5)).any():
-        raise ValueError("Yahoo 시각이 뉴욕 장중 평일이 아닌 행이 있습니다. 날짜 변환을 확인하세요.")
+        raise ValueError("Yahoo 시각이 그 시장의 장중 평일이 아닌 행이 있습니다. 날짜 변환을 확인하세요.")
     return local.tz_localize(None).normalize()
 
 
-def parse_yahoo(data: dict) -> pd.Series:
-    """Yahoo 차트 응답을 미국 동부 날짜 기준 일별 종가 Series로 바꿉니다.
+def parse_yahoo(data: dict, tz: ZoneInfo = US_MARKET_TZ) -> pd.Series:
+    """Yahoo 차트 응답을 그 시장의 날짜 기준 일별 종가 Series로 바꿉니다.
 
     Yahoo의 close는 분할만 반영하고 배당은 반영하지 않은 가격입니다.
     """
@@ -195,7 +212,7 @@ def parse_yahoo(data: dict) -> pd.Series:
     except (KeyError, IndexError, TypeError) as error:
         raise ValueError("Yahoo 응답 형식이 예상과 다릅니다.") from error
 
-    close = pd.Series(closes, index=yahoo_dates(timestamps), name="close", dtype="float64").dropna()
+    close = pd.Series(closes, index=yahoo_dates(timestamps, tz), name="close", dtype="float64").dropna()
     close = close[~close.index.duplicated(keep="last")].sort_index()
     close.index.name = "date"
     if (close <= 0).any():
@@ -203,17 +220,49 @@ def parse_yahoo(data: dict) -> pd.Series:
     return close
 
 
-def parse_yahoo_dividends(data: dict) -> pd.Series:
+def parse_yahoo_ohlc(data: dict, tz: ZoneInfo = KR_MARKET_TZ) -> pd.DataFrame:
+    """Yahoo 차트 응답을 일별 시가, 고가, 저가, 종가, 거래량 표로 바꿉니다.
+
+    종가가 없는 행과, 거래량이 0이면서 고가와 저가가 같은 행(거래가 없는 잘못된 행)은 뺍니다.
+    """
+    try:
+        result = data["chart"]["result"][0]
+        quote = result["indicators"]["quote"][0]
+        columns = {c: quote[c] for c in ["open", "high", "low", "close", "volume"]}
+        ohlc = pd.DataFrame(columns, index=yahoo_dates(result["timestamp"], tz), dtype="float64")
+    except (KeyError, IndexError, TypeError) as error:
+        raise ValueError("Yahoo 응답 형식이 예상과 다릅니다.") from error
+
+    ohlc = ohlc.dropna(subset=["close"])
+    ohlc = ohlc[~ohlc.index.duplicated(keep="last")].sort_index()
+    ohlc.index.name = "date"
+    ohlc = ohlc[~((ohlc["volume"].fillna(0) == 0) & (ohlc["high"] == ohlc["low"]))]
+
+    prices = ohlc[["open", "high", "low", "close"]]
+    if prices.isna().any(axis=None) or (prices <= 0).any(axis=None):
+        raise ValueError("Yahoo 시세에 비었거나 0 이하인 값이 있습니다.")
+    tolerance = 1e-6  # 소수점 저장 오차
+    upper, lower = prices[["open", "close"]].max(axis=1), prices[["open", "close"]].min(axis=1)
+    if ((ohlc["high"] < upper - tolerance) | (ohlc["low"] > lower + tolerance)).any():
+        raise ValueError("고가가 시가·종가보다 낮거나 저가가 시가·종가보다 높은 행이 있습니다.")
+    return ohlc
+
+
+def parse_yahoo_dividends(data: dict, tz: ZoneInfo = US_MARKET_TZ, between: tuple[str, str] | None = None) -> pd.Series:
     """Yahoo 배당 기록(배당락일 기준, 주당 금액)을 꺼냅니다.
 
+    between: 이 날짜 범위의 기록만 씁니다. 시세가 비어 있는 시기의 기록은 날짜가 어긋날 수 있어 범위로 거릅니다.
     분할 기록이 있으면 멈춥니다. 분할이 있는 종목은 배당과 가격의 기준을 맞추는 처리가 따로 필요합니다.
     """
     events = data["chart"]["result"][0].get("events", {})
     if events.get("splits"):
         raise ValueError("분할 기록이 있습니다. 분할 처리를 넣기 전에는 이 종목을 쓰지 않습니다.")
     records = sorted(events.get("dividends", {}).values(), key=lambda r: r["date"])
+    if between is not None:
+        first, last = (pd.Timestamp(day, tz=tz).timestamp() for day in between)
+        records = [r for r in records if first <= r["date"] < last + 86400]
     dividends = pd.Series(
-        [r["amount"] for r in records], index=yahoo_dates([r["date"] for r in records]), name="dividend", dtype="float64"
+        [r["amount"] for r in records], index=yahoo_dates([r["date"] for r in records], tz), name="dividend", dtype="float64"
     )
     dividends.index.name = "date"
     if not dividends.index.is_unique:
@@ -245,6 +294,36 @@ def build_etf_daily(close: pd.Series, dividends: pd.Series, rf_monthly: pd.Serie
     df["total_return"] = (df["close"] + df["dividend"]) / df["close"].shift(1) - 1
     df["rf"] = daily_rf(df.index, rf_monthly, current_month)
     return df
+
+
+def build_kospi_daily(ohlc: pd.DataFrame, cd_rate: pd.Series, current_month: pd.Period) -> pd.DataFrame:
+    """KOSPI 일별 표: 시가, 고가, 저가, 종가, 거래량, 일별 현금 수익률.
+
+    CD 금리(연율)를 12로 나눠 월 수익률로 보고, 그 달 거래일 수로 기하 분할합니다.
+    배당은 없습니다. ^KS11은 가격 지수입니다.
+    """
+    df = ohlc.copy()
+    df["rf"] = daily_rf(df.index, cd_rate / 12, current_month)
+    return df
+
+
+def parse_oecd_rate(text: str) -> pd.Series:
+    """OECD 단기 금리 CSV에서 한국 월평균 금리를 소수(0.1266 = 연 12.66%)로 꺼냅니다."""
+    raw = pd.read_csv(io.StringIO(text))
+    required = {"REF_AREA", "FREQ", "MEASURE", "UNIT_MEASURE", "TIME_PERIOD", "OBS_VALUE"}
+    if not required.issubset(raw.columns):
+        raise ValueError(f"OECD 파일에 필요한 열이 없습니다: {sorted(required - set(raw.columns))}")
+    expected = {"REF_AREA": "KOR", "FREQ": "M", "MEASURE": "IR3TIB", "UNIT_MEASURE": "PA"}
+    for column, value in expected.items():
+        if set(raw[column]) != {value}:
+            raise ValueError(f"OECD {column} 값이 '{value}'만 있어야 합니다: {sorted(set(raw[column]))}")
+
+    months = pd.PeriodIndex(raw["TIME_PERIOD"], freq="M", name="month")
+    rate = pd.Series(raw["OBS_VALUE"].to_numpy(dtype="float64") / 100, index=months, name="cd_rate").sort_index()
+    if rate.isna().any():
+        raise ValueError("OECD 금리에 빈 값이 있습니다.")
+    check_monthly_continuity(rate.index, "OECD 금리")
+    return rate
 
 
 def parse_french_rf(text: str) -> pd.Series:
@@ -370,9 +449,46 @@ def main(offline: bool = False) -> None:
     print(f"월말 표 결측 개수:\n{month_end.isna().sum().to_string()}")
 
 
+def main_kospi(offline: bool = False) -> None:
+    """KOSPI 실험용 표를 만듭니다. 미국 데이터의 원본과 표는 건드리지 않습니다."""
+    rate_path = RAW_DIR / "oecd_kor_ir3tib.csv"
+    if offline:
+        yahoo_paths = {symbol: RAW_DIR / name for symbol, name in YAHOO_KR_SYMBOLS.items()}
+        # 기준 시점은 ^KS11 원본을 내려받은 시각입니다.
+        manifest = json.loads(MANIFEST_PATH.read_text(encoding="utf-8"))
+        now = datetime.fromisoformat(manifest[YAHOO_KR_SYMBOLS["^KS11"]]["downloaded_at_utc"]).astimezone(KR_MARKET_TZ)
+    else:
+        yahoo_paths = {symbol: download_yahoo(symbol) for symbol in YAHOO_KR_SYMBOLS}
+        download_oecd_kr_rate(rate_path)
+        now = datetime.now(KR_MARKET_TZ)
+    current_month = pd.Period(now.date(), freq="M")
+
+    yahoo = {symbol: json.loads(path.read_text(encoding="utf-8")) for symbol, path in yahoo_paths.items()}
+    cd_rate = parse_oecd_rate(rate_path.read_text(encoding="utf-8"))
+
+    # 오늘은 장중일 수 있어 뺍니다.
+    ohlc = parse_yahoo_ohlc(yahoo["^KS11"])
+    kospi = build_kospi_daily(ohlc[ohlc.index.date < now.date()], cd_rate, current_month)
+
+    first, last = KODEX200_RANGE
+    kodex_close = parse_yahoo(yahoo["069500.KS"], KR_MARKET_TZ).loc[first:last]
+    kodex_dividends = parse_yahoo_dividends(yahoo["069500.KS"], KR_MARKET_TZ, between=KODEX200_RANGE)
+    kodex = build_etf_daily(kodex_close, kodex_dividends, cd_rate / 12, current_month)
+
+    for name, df in {"kospi_daily.csv": kospi, "kodex200_daily.csv": kodex}.items():
+        df.to_csv(DATA_DIR / name)
+        print(f"저장: data/{name} ({df.index[0]:%Y-%m-%d} ~ {df.index[-1]:%Y-%m-%d}, {len(df)}행)")
+    print(f"CD 금리 마지막 달: {cd_rate.index[-1]}")
+
+
 if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(description="시세 데이터 수집과 정리")
     parser.add_argument("--offline", action="store_true", help="내려받지 않고 data/raw/의 원본으로 표만 다시 만듭니다")
-    main(offline=parser.parse_args().offline)
+    parser.add_argument("--kospi", action="store_true", help="KOSPI 실험용 표만 만듭니다")
+    args = parser.parse_args()
+    if args.kospi:
+        main_kospi(offline=args.offline)
+    else:
+        main(offline=args.offline)
