@@ -337,6 +337,56 @@ def _last_trading_day_of_year(index: pd.DatetimeIndex) -> pd.Series:
 # ---------------------------------------------------------------- 지표
 
 
+def trade_list(holding_after_close: pd.Series, price: pd.Series, equity: pd.Series | None = None) -> pd.DataFrame:
+    """보유 구간(매수 체결일 ~ 매도 체결일)마다 보유 중 고점과 매도 시 고점 대비 하락률을 냅니다.
+
+    holding_after_close: 평가 기간(시작 전날 포함)의 체결 뒤 보유 상태 (run_backtest에 넘긴 것을 그 기간으로 자른 것).
+        첫날이 1이면 시작 전날 종가에 산 것으로 봅니다 (run_backtest도 그날 진입 비용을 냅니다).
+    price: 일별 종가. 고점은 매수 체결일부터 매도 체결일까지(양 끝 포함) 종가의 최댓값입니다.
+    equity: run_backtest의 daily["equity"]를 넘기면, 같은 방식의 자산 기준 하락률도 냅니다. 배당과 매도 비용이
+        반영되고, 매수 비용은 고점과 매도 값에 함께 들어가 비율에서 약분됩니다.
+    기간 끝까지 들고 있던 구간은 open=True이고, 매도일 자리에 마지막 날을 둡니다 (매도가 아닙니다).
+    """
+    held = holding_after_close.to_numpy()
+    if np.isnan(held).any() or not np.isin(held, [0.0, 1.0]).all():
+        raise ValueError("보유 상태가 0/1이 아닌 날이 있습니다.")
+    days = holding_after_close.index
+    spans, buy = [], days[0] if held[0] == 1.0 else None
+    for i in range(1, len(days)):
+        if held[i] == 1.0 and held[i - 1] == 0.0:
+            buy = days[i]
+        elif held[i] == 0.0 and held[i - 1] == 1.0:
+            spans.append((buy, days[i], False))
+            buy = None
+    if buy is not None:
+        spans.append((buy, days[-1], True))
+
+    rows = []
+    for buy, sell, still_open in spans:
+        segment = price.loc[buy:sell]
+        peak_day = segment.idxmax()
+        row = {
+            "buy_date": buy,
+            "buy_price": price[buy],
+            "peak_date": peak_day,
+            "peak_price": segment.max(),
+            "sell_date": sell,
+            "sell_price": price[sell],
+            "from_peak": price[sell] / segment.max() - 1,
+            "from_buy": price[sell] / price[buy] - 1,
+            "weeks_held": (sell - buy).days / 7,
+            "weeks_peak_to_sell": (sell - peak_day).days / 7,
+            "open": still_open,
+        }
+        if equity is not None:
+            value = equity.loc[buy:sell]
+            row["equity_from_peak"] = value.iloc[-1] / value.max() - 1
+        rows.append(row)
+    columns = ["buy_date", "buy_price", "peak_date", "peak_price", "sell_date", "sell_price", "from_peak", "from_buy",
+               "weeks_held", "weeks_peak_to_sell", "open"] + (["equity_from_peak"] if equity is not None else [])
+    return pd.DataFrame(rows, columns=columns)
+
+
 def metrics(result: Result) -> dict:
     """표준 리포트 지표. 일별 수익률 기준입니다. 첫 행(시작 전날)은 수익률 계산에서 뺍니다."""
     daily = result.daily
