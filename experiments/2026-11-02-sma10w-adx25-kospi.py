@@ -3,8 +3,9 @@
 실행:
     python experiments/2026-11-02-sma10w-adx25-kospi.py              # 설계용 기간
     python experiments/2026-11-02-sma10w-adx25-kospi.py --period oos # 표본 외 기간 (마지막에 한 번만)
+    python experiments/2026-11-02-sma10w-adx25-kospi.py --chart      # 보유 구간 차트만 (표는 다시 만들지 않음)
 
-결과 표는 reports/2026-11-02-sma10w-adx25-kospi/<기간>.md 에 저장합니다.
+결과 표는 reports/2026-11-02-sma10w-adx25-kospi/<기간>.md, 차트는 <기간>-holdings-<전략>.png 에 저장합니다.
 """
 
 import argparse
@@ -28,11 +29,13 @@ from src.backtest import (  # noqa: E402
     run_backtest,
     wilder_adx,
 )
+from src.charts import Panel, holding_chart, metrics_line  # noqa: E402
 
 PERIODS = {
     "design": ("1998-01-05", "2012-12-28"),
     "oos": ("2013-01-02", "2026-09-30"),
 }
+PERIOD_NAMES = {"design": "설계용 기간", "oos": "표본 외 기간"}
 BASE = {
     "window": 10,
     "adx_period": 14,
@@ -183,12 +186,74 @@ def kodex_check(kospi: pd.DataFrame, params: dict) -> list[dict]:
     return rows
 
 
+def chart(kospi: pd.DataFrame, period: str, start: str, end: str) -> list[Path]:
+    """기본 설정(세전)의 보유 구간, 신호에 쓴 지표, 전략과 단순 보유의 자산 가치를 그립니다.
+    10주 + ADX와 10주 단독을 따로 그립니다.
+
+    지표는 signal_for와 같은 입력(배당과 보수가 빠진 원지수)으로 계산합니다.
+    """
+    window, adx_period, threshold = BASE["window"], BASE["adx_period"], BASE["threshold"]
+    weeks = period_last_days(kospi.index, "W-FRI")
+    weekly = kospi["close"].reindex(weeks)
+    average = weekly.rolling(window).mean()
+    bars = period_bars(kospi, "W-FRI") if BASE["adx_frame"] == "week" else kospi
+    adx = wilder_adx(bars, adx_period).reindex(weeks)
+    frame = "주봉" if BASE["adx_frame"] == "week" else "일봉"
+
+    deviation = Panel(f"이격도: 주간 종가 / {window}주 이동평균 - 1", weekly / average - 1, 0.0, "이동평균", percent=True)
+    adx_panel = Panel(f"{frame} ADX({adx_period})", adx, threshold, f"기준 {threshold:.0f}")
+    costs = (
+        "비용: 편도 매매 비용 0.1%, 합성 ETF(배당 연 1.5%, 보수 연 0.15%), 현금은 CD 91일물, 원화 기준. "
+        "괄호 안은 같은 비용의 단순 보유. 음영은 매수 체결일 종가 ~ 매도 체결일 종가."
+    )
+    specs = [
+        (
+            "strategy", "sma10w-adx25", f"KOSPI {window}주 이동평균 + ADX 진입 필터", f"{window}주 이동평균 + {frame} ADX ≥ {threshold:.0f}",
+            f"규칙: 현금일 때 주 마지막 거래일 종가 > {window}주 이동평균이고 {frame} ADX({adx_period}) ≥ {threshold:.0f}이면 매수, "
+            "보유 중 종가 ≤ 이동평균이면 매도. 다음 거래일 종가에 체결.",
+            [deviation, adx_panel],
+        ),
+        (
+            "sma_only", "sma10w", f"KOSPI {window}주 이동평균 단독 (비교용)", f"{window}주 이동평균 단독",
+            f"규칙: 주 마지막 거래일 종가가 {window}주 이동평균보다 높으면 보유, 아니면 현금. 다음 거래일 종가에 체결.",
+            [deviation],
+        ),
+    ]
+
+    hold_result, hold = run(kospi, start, end, PRE_TAX, **BASE, kind="hold")
+    paths = []
+    for kind, slug, name, short_name, rule, panels in specs:
+        result, m = run(kospi, start, end, PRE_TAX, **BASE, kind=kind)
+        paths.append(holding_chart(
+            ROOT / "reports" / "2026-11-02-sma10w-adx25-kospi" / f"{period}-holdings-{slug}.png",
+            title=f"{name}: 보유 구간 ({PERIOD_NAMES[period]} {start} ~ {end})",
+            subtitle=[f"세전  ·  {metrics_line(m, hold)}", rule, costs],
+            price=kospi["close"],
+            price_label="KOSPI 지수 일별 종가 (배당 미포함, 로그 눈금)",
+            overlay=average,
+            overlay_label=f"{window}주 이동평균 (주간 종가)",
+            exposure=result.daily["holding"],
+            panels=panels,
+            equity=result.daily["equity"],
+            hold_equity=hold_result.daily["equity"],
+            strategy_label=short_name,
+        ))
+    return paths
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--period", choices=PERIODS, default="design")
-    period = parser.parse_args().period
+    parser.add_argument("--chart", action="store_true", help="보유 구간 차트만 만듭니다")
+    args = parser.parse_args()
+    period = args.period
     start, end = PERIODS[period]
     kospi = load_kospi()
+    if args.chart:
+        sys.stdout.reconfigure(encoding="utf-8")
+        for path in chart(kospi, period, start, end):
+            print(f"저장: {path.relative_to(ROOT)}")
+        return
 
     sections = [f"# 10주 이동평균 + ADX 진입 필터, KOSPI: {period} ({start} ~ {end})", ""]
     sections += [

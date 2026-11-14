@@ -3,8 +3,9 @@
 실행:
     python experiments/2026-10-12-sma10w-spy.py              # 설계용 기간
     python experiments/2026-10-12-sma10w-spy.py --period oos # 표본 외 기간 (마지막에 한 번만)
+    python experiments/2026-10-12-sma10w-spy.py --chart      # 보유 구간 차트만 (표는 다시 만들지 않음)
 
-결과 표는 reports/2026-10-12-sma10w-spy/<기간>.md 에 저장합니다.
+결과 표는 reports/2026-10-12-sma10w-spy/<기간>.md, 차트는 <기간>-holdings.png 에 저장합니다.
 """
 
 import argparse
@@ -17,11 +18,13 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from src.backtest import Costs, holding_from_signal, metrics, moving_average_signal, period_last_days, run_backtest  # noqa: E402
+from src.charts import Panel, holding_chart, metrics_line  # noqa: E402
 
 PERIODS = {
     "design": ("1994-01-03", "2012-12-31"),
     "oos": ("2013-01-02", "2026-08-31"),
 }
+PERIOD_NAMES = {"design": "설계용 기간", "oos": "표본 외 기간"}
 BASE = {"window": 10, "lag": 1, "trade": 0.001, "signal_price": "close"}
 PRE_TAX = {"dividend_withholding": 0.0, "capital_gains_tax": 0.0}
 AFTER_TAX = {"dividend_withholding": 0.15, "capital_gains_tax": 0.22}
@@ -72,12 +75,47 @@ def table(rows: list[dict]) -> str:
     return "\n".join([header, sep, *body])
 
 
+def chart(data: pd.DataFrame, period: str, start: str, end: str) -> Path:
+    """기본 설정(세전)의 보유 구간, 신호에 쓴 이동평균 이격도, 전략과 단순 보유의 자산 가치를 그립니다."""
+    result, m = run(data, start, end, **BASE, tax=PRE_TAX)
+    hold_result, hold = run(data, start, end, **BASE, tax=PRE_TAX, buy_and_hold=True)
+    weeks = period_last_days(data.index, "W-FRI")
+    weekly = data[BASE["signal_price"]].reindex(weeks)
+    average = weekly.rolling(BASE["window"]).mean()
+    window = BASE["window"]
+    return holding_chart(
+        ROOT / "reports" / "2026-10-12-sma10w-spy" / f"{period}-holdings.png",
+        title=f"SPY {window}주 이동평균: 보유 구간 ({PERIOD_NAMES[period]} {start} ~ {end})",
+        subtitle=[
+            f"세전  ·  {metrics_line(m, hold)}",
+            f"규칙: 주 마지막 거래일 종가가 {window}주 이동평균보다 높으면 보유, 아니면 현금. 신호 낸 날의 다음 거래일 종가에 체결.",
+            "비용: 편도 매매 비용 0.1%, 현금은 Ken French RF, 달러 기준. 괄호 안은 같은 비용의 단순 보유. "
+            "음영은 매수 체결일 종가 ~ 매도 체결일 종가.",
+        ],
+        price=data["close"],
+        price_label="SPY 일별 종가 (배당 미포함, 로그 눈금)",
+        overlay=average,
+        overlay_label=f"{window}주 이동평균 (주간 종가)",
+        exposure=result.daily["holding"],
+        panels=[Panel(f"이격도: 주간 종가 / {window}주 이동평균 - 1", weekly / average - 1, 0.0, "이동평균", percent=True)],
+        equity=result.daily["equity"],
+        hold_equity=hold_result.daily["equity"],
+        strategy_label=f"{window}주 이동평균",
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--period", choices=PERIODS, default="design")
-    period = parser.parse_args().period
+    parser.add_argument("--chart", action="store_true", help="보유 구간 차트만 만듭니다")
+    args = parser.parse_args()
+    period = args.period
     start, end = PERIODS[period]
     data = load_spy()
+    if args.chart:
+        sys.stdout.reconfigure(encoding="utf-8")
+        print(f"저장: {chart(data, period, start, end).relative_to(ROOT)}")
+        return
 
     sections = [f"# 10주 이동평균, SPY: {period} ({start} ~ {end})", ""]
     sections += [
