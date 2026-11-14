@@ -32,6 +32,45 @@ class Costs:
     interest_tax: float = 0.0
 
 
+# ---------------------------------------------------------------- 투자 수익률 합성
+
+
+def synthetic_index_etf(
+    index_daily: pd.DataFrame, dividend_yield: float, dividend_timing: str, expense: float, cash: str
+) -> pd.DataFrame:
+    """배당이 빠진 가격 지수로 지수 추종 ETF를 합성합니다. 보수는 가격에서 빼고, 지수에 빠진 배당은 dividend 열로 더합니다.
+
+    index_daily: close(가격 지수), rf(일별 현금 수익률) 열.
+    배당 금액은 전날 종가 × 수익률입니다. 지수에는 배당락으로 떨어진 가격이 이미 들어 있습니다.
+    - december: 매년 12월의 마지막 거래일 전날(국내 12월 결산 기업의 배당락 시기)에 한 번에 받습니다.
+    - even: 달력 일수에 비례해 매일 나눠 받습니다.
+    cash: "cd"면 rf를 그대로, "zero"면 현금 수익률 0.
+    """
+    index = index_daily.index
+    years = (index - index[0]).days / 365.25
+    close = index_daily["close"] * (1 - expense) ** years
+    previous = close.shift(1)
+
+    if dividend_timing == "december":
+        december = pd.Series(index, index=index)[index.month == 12]
+        ex_days = december.groupby(december.index.year).nth(-2)
+        dividend = pd.Series(0.0, index=index)
+        dividend[pd.DatetimeIndex(ex_days)] = dividend_yield * previous[pd.DatetimeIndex(ex_days)]
+    elif dividend_timing == "even":
+        elapsed = pd.Series(index, index=index).diff().dt.days / 365.25
+        dividend = (dividend_yield * elapsed * previous).fillna(0.0)
+    else:
+        raise ValueError(f"알 수 없는 배당 시점: {dividend_timing}")
+
+    if cash == "cd":
+        rf = index_daily["rf"]
+    elif cash == "zero":
+        rf = index_daily["rf"] * 0.0
+    else:
+        raise ValueError(f"알 수 없는 현금 가정: {cash}")
+    return pd.DataFrame({"close": close, "dividend": dividend, "rf": rf}, index=index)
+
+
 # ---------------------------------------------------------------- 신호
 
 
@@ -121,6 +160,36 @@ def moving_average_adx_signal(
             state = 1.0
         signal[day] = state
     return signal
+
+
+def moving_average_slope_signal(price: pd.Series, signal_days: pd.DatetimeIndex, window: int, slope_lag: int = 1) -> pd.Series:
+    """이동평균 신호에 이동평균 기울기 필터를 더합니다.
+
+    m = 종가 > 이동평균, 기울기 = 이번 주 이동평균 − slope_lag주 전 이동평균.
+    - 미보유: m이고 기울기 >= 0이면 보유. 기울기 < 0(하락 중)이면 매수하지 않습니다.
+    - 보유: m이 아니고 기울기 <= 0이면 미보유. 기울기 > 0(상승 중)이면 매도하지 않습니다.
+    기울기가 준비되기 전은 NaN이고, 준비된 첫 주는 m으로 시작합니다.
+    """
+    if slope_lag < 1:
+        raise ValueError("slope_lag는 1 이상이어야 합니다.")
+    sampled = price.reindex(signal_days)
+    if sampled.isna().any():
+        raise ValueError("신호 날짜에 가격이 없습니다.")
+    average = sampled.rolling(window).mean()
+    above = (sampled > average).to_numpy()
+    slope = (average - average.shift(slope_lag)).to_numpy()
+
+    signal = np.full(len(signal_days), np.nan)
+    state = np.nan
+    for i in np.flatnonzero(~np.isnan(slope)):
+        if np.isnan(state):
+            state = 1.0 if above[i] else 0.0
+        elif state == 0.0 and above[i] and slope[i] >= 0:
+            state = 1.0
+        elif state == 1.0 and not above[i] and slope[i] <= 0:
+            state = 0.0
+        signal[i] = state
+    return pd.Series(signal, index=signal_days, name="signal")
 
 
 def holding_from_signal(signal: pd.Series, index: pd.DatetimeIndex, lag: int = 1) -> pd.Series:

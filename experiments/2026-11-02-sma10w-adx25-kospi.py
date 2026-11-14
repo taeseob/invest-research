@@ -12,7 +12,6 @@ import argparse
 import sys
 from pathlib import Path
 
-import numpy as np
 import pandas as pd
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -27,6 +26,7 @@ from src.backtest import (  # noqa: E402
     period_bars,
     period_last_days,
     run_backtest,
+    synthetic_index_etf,
     wilder_adx,
 )
 from src.charts import Panel, holding_chart, metrics_line  # noqa: E402
@@ -56,31 +56,8 @@ def load_kospi() -> pd.DataFrame:
     return pd.read_csv(ROOT / "data" / "kospi_daily.csv", index_col=0, parse_dates=True)
 
 
-def investable(kospi: pd.DataFrame, dividend_yield: float, dividend_timing: str, expense: float, cash: str) -> pd.DataFrame:
-    """지수를 따라가는 ETF를 합성합니다. 보수는 가격에서 빼고, 지수에 빠진 배당은 dividend 열로 더합니다.
-
-    배당 금액은 전날 종가 × 수익률입니다. 지수에는 배당락으로 떨어진 가격이 이미 들어 있습니다.
-    - december: 매년 12월의 마지막 거래일 전날(국내 12월 결산 기업의 배당락 시기)에 한 번에 받습니다.
-    - even: 달력 일수에 비례해 매일 나눠 받습니다.
-    """
-    index = kospi.index
-    years = (index - index[0]).days / 365.25
-    close = kospi["close"] * (1 - expense) ** years
-    previous = close.shift(1)
-
-    if dividend_timing == "december":
-        december = pd.Series(index, index=index)[index.month == 12]
-        ex_days = december.groupby(december.index.year).nth(-2)
-        dividend = pd.Series(0.0, index=index)
-        dividend[pd.DatetimeIndex(ex_days)] = dividend_yield * previous[pd.DatetimeIndex(ex_days)]
-    elif dividend_timing == "even":
-        elapsed = pd.Series(index, index=index).diff().dt.days / 365.25
-        dividend = (dividend_yield * elapsed * previous).fillna(0.0)
-    else:
-        raise ValueError(f"알 수 없는 배당 시점: {dividend_timing}")
-
-    rf = kospi["rf"] if cash == "cd" else kospi["rf"] * 0.0
-    return pd.DataFrame({"close": close, "dividend": dividend, "rf": rf}, index=index)
+# 지수를 따라가는 ETF 합성. 2026-11-15에 src/backtest.py로 옮겼습니다 (계산은 그대로).
+investable = synthetic_index_etf
 
 
 def signal_for(kospi: pd.DataFrame, window: int, adx_period: int, threshold: float, adx_frame: str, use_adx: bool) -> pd.Series:
