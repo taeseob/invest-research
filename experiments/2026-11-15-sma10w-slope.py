@@ -17,6 +17,7 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -31,9 +32,11 @@ from src.backtest import (  # noqa: E402
     moving_average_slope_signal,
     period_last_days,
     run_backtest,
+    snap_to_tick,
     synthetic_index_etf,
 )
 from src.charts import Panel, holding_chart, metrics_line  # noqa: E402
+from src.data import PRICE_TICK  # noqa: E402
 
 EXPERIMENT = "2026-11-15-sma10w-slope"
 PERIOD_NAMES = {"design": "설계용 기간", "oos": "표본 외 기간"}
@@ -47,7 +50,8 @@ NO_TAX = {"dividend_withholding": 0.0, "capital_gains_tax": 0.0, "interest_tax":
 class Asset:
     key: str
     name: str
-    signal_price: pd.Series  # 신호를 계산하는 가격 (배당 미포함)
+    price: pd.Series  # 차트에 그리는 가격 (배당 미포함)
+    signal_price: pd.Series  # 신호를 계산하는 가격: price를 호가 단위 개수로 바꾼 것 (snap_to_tick)
     data: pd.DataFrame  # 수익률을 계산하는 표: close, dividend, rf
     price_label: str
     periods: dict
@@ -66,7 +70,8 @@ def load_assets() -> list[Asset]:
         Asset(
             key="spy",
             name="SPY",
-            signal_price=spy["close"],
+            price=spy["close"],
+            signal_price=snap_to_tick(spy["close"], PRICE_TICK["SPY"]),
             data=spy[["close", "dividend", "rf"]],
             price_label="SPY 일별 종가 (배당 미포함, 로그 눈금)",
             periods={"design": ("1994-01-03", "2012-12-31"), "oos": ("2013-01-02", "2026-08-31")},
@@ -87,7 +92,8 @@ def load_assets() -> list[Asset]:
         Asset(
             key="kospi",
             name="KOSPI",
-            signal_price=kospi["close"],
+            price=kospi["close"],
+            signal_price=snap_to_tick(kospi["close"], PRICE_TICK["^KS11"]),
             data=kospi_etf,
             price_label="KOSPI 지수 일별 종가 (배당 미포함, 로그 눈금)",
             periods={"design": ("1998-01-05", "2012-12-28"), "oos": ("2013-01-02", "2026-09-30")},
@@ -188,18 +194,35 @@ def filter_effect(asset: Asset, start: str, end: str) -> tuple[list[dict], list[
     excess = ((data["close"] + data["dividend"]) / data["close"].shift(1) - 1 - data["rf"]).reindex(strategy.daily.index)
     s, p = strategy.daily["holding"].iloc[1:] == 1.0, plain.daily["holding"].iloc[1:] == 1.0
     excess = excess.iloc[1:]
-    daily_rows = []
-    for label, mask in [
-        ("필터가 붙잡아 둔 날 (10주 단독 현금, 필터 주식)", s & ~p),
-        ("필터가 막은 날 (10주 단독 주식, 필터 현금)", ~s & p),
-        ("둘 다 주식", s & p),
-        ("둘 다 현금", ~s & ~p),
+    # 기여: 필터가 주식이고 10주 단독이 현금인 날은 필터가 초과수익률만큼 더 벌고, 반대인 날은 그만큼 덜 법니다.
+    daily_rows, total = [], 0.0
+    for label, mask, sign in [
+        ("필터가 붙잡아 둔 날 (10주 단독 현금, 필터 주식)", s & ~p, 1.0),
+        ("필터가 막은 날 (10주 단독 주식, 필터 현금)", ~s & p, -1.0),
+        ("둘 다 주식", s & p, 0.0),
+        ("둘 다 현금", ~s & ~p, 0.0),
     ]:
+        days = excess[mask]
+        annual = days.mean() * TRADING_DAYS
+        t_value = days.mean() / (days.std() / np.sqrt(len(days))) if len(days) > 1 else np.nan
+        contribution = sign * mask.mean() * annual
+        total += contribution
         daily_rows.append({
             "구분": label,
+            "날 수": int(mask.sum()),
             "날 비율": f"{mask.mean():.1%}",
-            "자산 초과수익률 (연환산, 세전)": f"{excess[mask].mean() * TRADING_DAYS:.1%}" if mask.any() else "-",
+            "자산 초과수익률 (연환산)": f"{annual:.1%}" if len(days) else "-",
+            "t값": f"{t_value:+.2f}" if len(days) > 1 else "-",
+            "CAGR 차이 기여 (%p)": f"{contribution * 100:+.2f}" if sign else "0 (같은 상태)",
         })
+    saving = (m_plain["trades_per_year"] - m["trades_per_year"]) * BASE["trade"]
+    total += saving
+    blank = {"날 수": "-", "날 비율": "-", "자산 초과수익률 (연환산)": "-", "t값": "-"}
+    daily_rows += [
+        {"구분": "매매 비용 절감 (연간 매매 차이 × 편도 비용)", **blank, "CAGR 차이 기여 (%p)": f"{saving * 100:+.2f}"},
+        {"구분": "합계 (어림값)", **blank, "CAGR 차이 기여 (%p)": f"{total * 100:+.2f}"},
+        {"구분": "실제 CAGR 차이 (기울기 필터 − 10주 단독)", **blank, "CAGR 차이 기여 (%p)": f"{(m['cagr'] - m_plain['cagr']) * 100:+.2f}"},
+    ]
     return weekly_rows, daily_rows
 
 
@@ -225,7 +248,10 @@ def asset_report(asset: Asset, period: str) -> list[str]:
 
     weekly_rows, daily_rows = filter_effect(asset, start, end)
     lines += ["## 필터가 한 일 (세전)", "", table(weekly_rows), "", table(daily_rows), "",
-              "필터가 맞게 골랐다면 '붙잡아 둔 날'의 초과수익률은 양수, '막은 날'은 음수여야 합니다.", ""]
+              "필터가 맞게 골랐다면 '붙잡아 둔 날'의 초과수익률은 양수, '막은 날'은 음수여야 합니다.",
+              "초과수익률은 자산 수익률(배당 포함) − 현금 수익률입니다. 기여는 날 비율 × 연환산 초과수익률이고, 필터가 현금인 날은 부호를 바꿉니다.",
+              "산술 평균으로 어림한 값이라 합계가 실제 CAGR 차이와 조금 다릅니다. "
+              "t값은 일별 초과수익률의 평균 / 표준오차이고, 수익률의 자기상관을 무시하므로 실제 유의성은 이보다 약합니다.", ""]
 
     def sensitivity(title: str, variants: list[tuple[str, str, dict]], taxes=None) -> None:
         for label, tax in taxes or [("세전", pre_tax), ("세후", after_tax)]:
@@ -262,12 +288,14 @@ def asset_report(asset: Asset, period: str) -> list[str]:
 
 def chart(asset: Asset, period: str) -> list[Path]:
     """기본 설정(세전)의 보유 구간, 신호에 쓴 지표, 전략과 단순 보유의 자산 가치를 그립니다.
-    기울기 필터와 10주 단독을 따로 그립니다. 지표는 신호와 같은 입력(배당 미포함 가격)으로 계산합니다.
+    기울기 필터와 10주 단독을 따로 그립니다. 지표는 신호와 같은 배당 미포함 가격으로 계산하되,
+    눈금이 가격 단위로 나오도록 호가 단위로 바꾸기 전의 가격을 씁니다. 비율이라 부호는 신호와 같지만,
+    정확한 동률(종가 = 이동평균, 기울기 = 0)인 주는 float32 잔여 오차 때문에 0이 아닌 아주 작은 값으로 그려질 수 있습니다.
     """
     start, end = asset.periods[period]
     window = BASE["window"]
-    weeks = period_last_days(asset.signal_price.index, BASE["week"])
-    weekly = asset.signal_price.reindex(weeks)
+    weeks = period_last_days(asset.price.index, BASE["week"])
+    weekly = asset.price.reindex(weeks)
     average = weekly.rolling(window).mean()
     change = average / average.shift(BASE["slope_lag"]) - 1
 
@@ -303,7 +331,7 @@ def chart(asset: Asset, period: str) -> list[Path]:
             ROOT / "reports" / EXPERIMENT / f"{period}-holdings-{asset.key}-{slug}.png",
             title=f"{name}: 보유 구간 ({PERIOD_NAMES[period]} {start} ~ {end})",
             subtitle=[f"세전  ·  {metrics_line(m, hold)}", *rule, f"{asset.chart_costs} {note}"],
-            price=asset.signal_price,
+            price=asset.price,
             price_label=asset.price_label,
             overlay=average,
             overlay_label=f"{window}주 이동평균 (주간 종가)",

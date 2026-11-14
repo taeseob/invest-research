@@ -13,6 +13,7 @@ from src.backtest import (
     moving_average_slope_signal,
     period_last_days,
     run_backtest,
+    snap_to_tick,
     synthetic_index_etf,
 )
 
@@ -121,6 +122,76 @@ def test_matches_independent_implementation_with_past_close():
             state = 0.0
         expected[i] = state
     np.testing.assert_array_equal(strategy_signal(data).to_numpy(), expected)
+
+
+def integer_reference(ticks: np.ndarray, window: int, slope_lag: int) -> tuple[np.ndarray, np.ndarray]:
+    """정수 합만으로 계산한 (이동평균 단독 신호, 기울기 필터 신호). 이동평균 = 합 / window이므로 나누지 않고 비교합니다."""
+    n = len(ticks)
+    plain, slope = np.full(n, np.nan), np.full(n, np.nan)
+    state = None
+    for i in range(window - 1, n):
+        total = int(ticks[i - window + 1 : i + 1].sum())
+        above = window * int(ticks[i]) > total
+        plain[i] = 1.0 if above else 0.0
+        if i < window - 1 + slope_lag:
+            continue
+        before = int(ticks[i - slope_lag - window + 1 : i - slope_lag + 1].sum())
+        rising, falling = total > before, total < before
+        if state is None:
+            state = 1.0 if above else 0.0
+        elif state == 0.0 and above and not falling:
+            state = 1.0
+        elif state == 1.0 and not above and not rising:
+            state = 0.0
+        slope[i] = state
+    return plain, slope
+
+
+@pytest.mark.parametrize("window", [5, 10, 20, 40])
+@pytest.mark.parametrize("slope_lag", [1, 2, 4])
+def test_matches_integer_reference_on_float32_prices_with_ties(window, slope_lag):
+    """센트 단위 가격을 float32로 저장한 데이터(Yahoo와 같은 형태)에서, 호가 단위로 바꾼 신호가 정수 계산과 같아야 합니다.
+
+    주간 변화를 -1 ~ +1센트로 작게 두어 '종가 = 이동평균'과 '기울기 = 0' 동률이 자주 생기게 합니다.
+    """
+    rng = np.random.default_rng(window * 10 + slope_lag)
+    cents = 12_600 + np.cumsum(rng.integers(-1, 2, 1500))
+    days = pd.bdate_range("2000-01-07", periods=len(cents), freq="W-FRI")
+    stored = pd.Series(np.float32(cents / 100).astype(float), index=days)
+    expected_plain, expected_slope = integer_reference(cents, window, slope_lag)
+
+    ticks = snap_to_tick(stored, 0.01)
+    np.testing.assert_array_equal(ticks.to_numpy(), cents)
+    np.testing.assert_array_equal(moving_average_signal(ticks, days, window).to_numpy(), expected_plain)
+    np.testing.assert_array_equal(moving_average_slope_signal(ticks, days, window, slope_lag).to_numpy(), expected_slope)
+
+    # 동률이 실제로 생겨 경계를 시험했는지 확인합니다.
+    totals = pd.Series(cents).rolling(window).sum()
+    assert (window * pd.Series(cents) == totals).sum() > 0
+    assert (totals == totals.shift(slope_lag)).sum() > 0
+
+
+def test_float32_residual_does_not_turn_tie_into_above():
+    # SPY 2005-11-18 ~ 12-16 주간 종가. 마지막 종가 126.36 = 5주 평균 (631.80 / 5).
+    days = pd.bdate_range("2005-11-18", periods=5, freq="W-FRI")
+    stored = pd.Series(np.float32([125.13, 127.13, 126.85, 126.33, 126.36]).astype(float), index=days)
+    # 저장된 값을 그대로 쓰면 float32 잔여 오차 때문에 '높다'로 판정됩니다. 이 테스트가 그 경우를 다루는지 확인합니다.
+    assert moving_average_signal(stored, days, 5).iloc[-1] == 1.0
+    assert moving_average_signal(snap_to_tick(stored, 0.01), days, 5).iloc[-1] == 0.0
+
+    # 기울기 필터도 같습니다. 앞에 한 주를 붙여 마지막 주에 기울기가 처음 나오게 하면, 시작 상태가 m(= 0)입니다.
+    days6 = pd.bdate_range("2005-11-11", periods=6, freq="W-FRI")
+    stored6 = pd.Series(np.float32([124.0, 125.13, 127.13, 126.85, 126.33, 126.36]).astype(float), index=days6)
+    assert moving_average_slope_signal(stored6, days6, 5).iloc[-1] == 1.0
+    assert moving_average_slope_signal(snap_to_tick(stored6, 0.01), days6, 5).iloc[-1] == 0.0
+
+
+def test_snap_to_tick_recovers_grid_and_rejects_off_grid_prices():
+    stored = pd.Series(np.float32([126.36, 43.9375, 0.01, 700.21]).astype(float))
+    # SPY 호가 단위 1/1600달러: 센트(16단위)와 1/64달러(25단위)의 공배수
+    np.testing.assert_array_equal(snap_to_tick(stored, 1 / 1600).to_numpy(), [202_176, 70_300, 16, 1_120_336])
+    with pytest.raises(ValueError, match="격자"):
+        snap_to_tick(pd.Series([100.003]), 0.01)
 
 
 def test_state_changes_only_when_base_signal_and_slope_agree():

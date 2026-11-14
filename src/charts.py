@@ -69,6 +69,15 @@ def metrics_line(strategy: dict, hold: dict) -> str:
     )
 
 
+def percent_label(value: float) -> str:
+    """눈금 값(0.025)을 백분율 글자(2.5%)로 바꿉니다. 소수는 필요한 만큼만 씁니다.
+
+    소수 없이 반올림하면 2.5% 간격 눈금이 5%, 3%, 0%, -2%처럼 간격이 다르게 찍힙니다.
+    부동소수 잔여 오차(7.000000000000001)는 소수 여섯째 자리에서 지우고, -0은 0으로 씁니다.
+    """
+    return f"{round(value * 100, 6) + 0.0:g}%"
+
+
 def _log_ticks(low: float, high: float) -> list[float]:
     """로그 눈금에 쓸 깔끔한 값. 너무 많으면 1, 2, 5 배수만 남깁니다."""
     ticks = [
@@ -224,7 +233,7 @@ def holding_chart(
                 fontsize=9, color=INK_SECONDARY)
         ax.set_title(panel.title, loc="left", fontsize=10, color=INK, pad=5)
         if panel.percent:
-            ax.yaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v:.0%}"))
+            ax.yaxis.set_major_formatter(FuncFormatter(lambda v, _: percent_label(v)))
 
     # 자산 가치 칸
     if equity is not None:

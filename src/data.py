@@ -43,6 +43,9 @@ OECD_KR_RATE = (
 )
 # Yahoo의 KODEX 200은 2009-04 전이 대부분 비어 있습니다. 교차 확인은 설계용 기간 안에서만 합니다.
 KODEX200_RANGE = ("2009-06-01", "2012-12-31")
+# 가격의 호가 단위 (backtest.snap_to_tick에 씁니다).
+# SPY는 2001-01-26까지 1/64달러 단위, 그 뒤 센트 단위라 둘의 공배수인 1/1600달러를 씁니다. KOSPI 지수는 소수 둘째 자리입니다.
+PRICE_TICK = {"SPY": 1 / 1600, "^KS11": 0.01}
 
 US_MARKET_TZ = ZoneInfo("America/New_York")
 KR_MARKET_TZ = ZoneInfo("Asia/Seoul")

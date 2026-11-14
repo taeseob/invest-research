@@ -3,7 +3,7 @@ import pandas as pd
 import pytest
 
 from src.backtest import Costs, run_backtest
-from src.charts import Panel, holding_chart, holding_spans, start_at_one
+from src.charts import Panel, holding_chart, holding_spans, percent_label, start_at_one
 
 
 def test_holding_spans_from_exposure():
@@ -65,3 +65,12 @@ def test_holding_chart_rejects_equity_from_other_period(tmp_path):
         holding_chart(tmp_path / "chart.png", "제목", [], price, "가격", exposure, [], equity=other, hold_equity=other)
     with pytest.raises(ValueError):
         holding_chart(tmp_path / "chart.png", "제목", [], price, "가격", exposure, [], equity=other)
+
+
+@pytest.mark.parametrize(
+    "value, label",
+    [(0.025, "2.5%"), (0.05, "5%"), (-0.02, "-2%"), (0.0, "0%"), (-0.0, "0%"), (0.1, "10%"), (0.07500000000000001, "7.5%"), (-0.2, "-20%")],
+)
+def test_percent_label_keeps_needed_decimals(value, label):
+    # 소수 없이 반올림하면 2.5% 간격 눈금이 5%, 3%, 0%, -2%처럼 찍혔습니다.
+    assert percent_label(value) == label

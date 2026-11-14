@@ -26,10 +26,12 @@ from src.backtest import (  # noqa: E402
     period_bars,
     period_last_days,
     run_backtest,
+    snap_to_tick,
     synthetic_index_etf,
     wilder_adx,
 )
 from src.charts import Panel, holding_chart, metrics_line  # noqa: E402
+from src.data import PRICE_TICK  # noqa: E402
 
 PERIODS = {
     "design": ("1998-01-05", "2012-12-28"),
@@ -64,9 +66,14 @@ def signal_for(kospi: pd.DataFrame, window: int, adx_period: int, threshold: flo
     """신호는 배당과 보수가 빠진 원지수로 계산합니다. 그 주 마지막 거래일 종가까지의 값만 씁니다."""
     weeks = period_last_days(kospi.index, "W-FRI")
     if not use_adx:
-        return moving_average_signal(kospi["close"], weeks, window)
+        return moving_average_signal(signal_close(kospi), weeks, window)
     bars = period_bars(kospi, "W-FRI") if adx_frame == "week" else kospi
-    return moving_average_adx_signal(kospi["close"], weeks, window, wilder_adx(bars, adx_period), threshold)
+    return moving_average_adx_signal(signal_close(kospi), weeks, window, wilder_adx(bars, adx_period), threshold)
+
+
+def signal_close(kospi: pd.DataFrame) -> pd.Series:
+    """이동평균 비교에 쓰는 종가. float32 잔여 오차를 지운 호가 단위 가격입니다 (2026-11-15 추가)."""
+    return snap_to_tick(kospi["close"], PRICE_TICK["^KS11"])
 
 
 def run(kospi, start, end, tax, window, adx_period, threshold, adx_frame, lag, trade, dividend_yield, dividend_timing, expense, cash, kind="strategy"):
@@ -116,7 +123,7 @@ def comparison_rows(kospi, start, end, tax, params) -> list[dict]:
 def filter_effect(kospi: pd.DataFrame, start: str, end: str) -> list[dict]:
     """ADX 필터가 진입을 얼마나 막았는지 주 단위로 셉니다."""
     weeks = period_last_days(kospi.index, "W-FRI")
-    above = moving_average_signal(kospi["close"], weeks, BASE["window"])
+    above = moving_average_signal(signal_close(kospi), weeks, BASE["window"])
     signal = signal_for(kospi, BASE["window"], BASE["adx_period"], BASE["threshold"], BASE["adx_frame"], use_adx=True)
     adx = wilder_adx(period_bars(kospi, "W-FRI"), BASE["adx_period"]).reindex(weeks)
     in_period = (weeks >= pd.Timestamp(start)) & (weeks <= pd.Timestamp(end))

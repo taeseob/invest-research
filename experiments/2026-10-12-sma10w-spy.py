@@ -17,8 +17,17 @@ import pandas as pd
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from src.backtest import Costs, holding_from_signal, metrics, moving_average_signal, period_last_days, run_backtest  # noqa: E402
+from src.backtest import (  # noqa: E402
+    Costs,
+    holding_from_signal,
+    metrics,
+    moving_average_signal,
+    period_last_days,
+    run_backtest,
+    snap_to_tick,
+)
 from src.charts import Panel, holding_chart, metrics_line  # noqa: E402
+from src.data import PRICE_TICK  # noqa: E402
 
 PERIODS = {
     "design": ("1994-01-03", "2012-12-31"),
@@ -45,7 +54,11 @@ def run(data, start, end, window, lag, trade, signal_price, tax, buy_and_hold=Fa
         holding = pd.Series(1.0, index=data.index)
     else:
         weeks = period_last_days(data.index, "W-FRI")
-        signal = moving_average_signal(data[signal_price], weeks, window)
+        # 종가 신호는 float32 잔여 오차를 지운 호가 단위 가격으로 계산합니다 (2026-11-15 추가).
+        # 총수익 기준 가격은 호가 격자가 없어 그대로 씁니다. 배당락일 사이에는 종가에 비례하므로 종가의 동률이
+        # 그대로 생길 수 있지만, 설계용 기간에는 그런 동률이 없음을 검증에서 확인했습니다 (2026-11-15).
+        price = snap_to_tick(data["close"], PRICE_TICK["SPY"]) if signal_price == "close" else data[signal_price]
+        signal = moving_average_signal(price, weeks, window)
         holding = holding_from_signal(signal, data.index, lag)
     result = run_backtest(data, holding, start, end, costs)
     return result, metrics(result)

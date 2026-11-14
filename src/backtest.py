@@ -84,6 +84,22 @@ def period_last_days(index: pd.DatetimeIndex, freq: str) -> pd.DatetimeIndex:
     return pd.DatetimeIndex(days.groupby(index.to_period(freq)).last().to_numpy(), name=index.name)
 
 
+def snap_to_tick(price: pd.Series, tick: float) -> pd.Series:
+    """가격을 호가 단위의 정수 배(단위: 호가 단위 개수)로 바꿉니다. 신호 계산에만 씁니다.
+
+    Yahoo 가격은 float32로 저장되어 126.36이 126.36000061035156처럼 남습니다. 그대로 이동평균과 비교하면
+    실제 가격으로는 같은 값(종가 = 이동평균)이 '높다'로 판정될 수 있습니다. 정수로 바꾸면 합이 정확해져
+    종가와 이동평균의 비교, 이동평균 기울기의 부호가 정확해집니다. 비교는 비율이라 단위를 바꿔도 뜻은 같습니다.
+    격자에서 호가 단위의 1/4 넘게 벗어난 가격이 있으면 호가 단위 가정이 틀린 것이므로 멈춥니다.
+    """
+    units = price / tick
+    rounded = units.round()
+    off = (units - rounded).abs()
+    if (off > 0.25).any():
+        raise ValueError(f"호가 단위 {tick}의 격자에서 벗어난 가격이 있습니다: {off.idxmax()}")
+    return rounded
+
+
 def moving_average_signal(price: pd.Series, signal_days: pd.DatetimeIndex, window: int) -> pd.Series:
     """signal_days의 종가가 최근 window개 signal_days 종가(그날 포함)의 평균보다 높으면 1, 아니면 0.
 
