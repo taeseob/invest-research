@@ -30,6 +30,18 @@ def test_holding_spans_match_execution_days_of_backtest():
     assert holding_spans(result.daily["holding"]) == [(index[1], index[3]), (index[4], index[7])]
 
 
+def test_short_spans_match_execution_days_of_long_short_backtest():
+    """롱/숏: 주식 구간과 인버스 구간이 체결일에서 맞닿고, 서로 겹치지 않아야 합니다."""
+    index = pd.bdate_range("2020-01-01", periods=8)
+    data = pd.DataFrame({"close": np.linspace(100, 110, 8), "dividend": 0.0, "rf": 0.0001}, index=index)
+    inverse = pd.DataFrame({"close": np.linspace(1, 0.9, 8)}, index=index)
+    after_close = pd.Series([1, 1, -1, -1, -1, 1, 1, -1], index=index, dtype=float)
+    result = run_backtest(data, after_close, str(index[1].date()), str(index[-1].date()), Costs(), inverse)
+    exposure = result.daily["holding"]
+    assert holding_spans(exposure, 1.0) == [(index[0], index[2]), (index[5], index[7])]
+    assert holding_spans(exposure, -1.0) == [(index[2], index[5])]
+
+
 def test_start_at_one_matches_metrics_curve():
     """자산 가치 칸의 곡선은 metrics가 MDD를 잴 때 쓰는 곡선과 같아야 합니다 (첫날 1.0, 그 뒤는 일별 자산)."""
     index = pd.bdate_range("2020-01-01", periods=6)

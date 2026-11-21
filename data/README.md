@@ -2,7 +2,7 @@
 
 내려받은 시세 데이터를 두는 폴더입니다. 이 README를 빼고는 저장소에 올라가지 않습니다.
 
-데이터는 언제든 `src/`의 수집 코드로 다시 받을 수 있어야 합니다. 모두 `python -m src.data`로 만들고, 이미 받은 원본으로 표만 다시 만들 때는 `python -m src.data --offline`을 씁니다. KOSPI 표는 `python -m src.data --kospi`로 따로 만듭니다 (`--kospi --offline` 가능).
+데이터는 언제든 `src/`의 수집 코드로 다시 받을 수 있어야 합니다. 모두 `python -m src.data`로 만들고, 이미 받은 원본으로 표만 다시 만들 때는 `python -m src.data --offline`을 씁니다. KOSPI 표는 `python -m src.data --kospi`로 따로 만듭니다 (`--kospi --offline` 가능). 인버스 ETF 표는 `python -m src.data --inverse`로 따로 만듭니다 (`--inverse --offline` 가능, 현금 수익률은 이미 받은 Ken French·OECD 원본 사용).
 
 | 파일 | 내용 |
 |---|---|
@@ -22,6 +22,10 @@
 | `sp500_monthly_avg.csv` | Faber 재현 보조 시험용. Shiller 월평균 가격, 배당, 총수익률, RF |
 | `kospi_daily.csv` | KOSPI 일별 시가, 고가, 저가, 종가, 거래량, 일별 현금 수익률 (CD 금리 / 12를 그 달 거래일 수로 기하 분할). 배당 없는 가격 지수 |
 | `kodex200_daily.csv` | KODEX 200 종가, 분배금, 수익률 (2009-06 ~ 2012-12만. KOSPI 합성 수익률 교차 확인용) |
+| `raw/yahoo_sh.json` | Yahoo SH(ProShares Short S&P500) 일별 시세와 분배금 원본 |
+| `raw/yahoo_kodex_inverse.json` | Yahoo `114800.KS` KODEX 인버스 일별 시세 원본 |
+| `sh_daily.csv` | SH 종가, 분배금, 수익률, 일별 RF (2006-06-21 ~ 2012-12-31만. 합성 인버스 교차 확인용) |
+| `kodex_inverse_daily.csv` | KODEX 인버스 종가, 수익률, 일별 CD 금리 (2009-09-16 ~ 2012-12-28만. 합성 인버스 교차 확인용) |
 
 주의:
 
@@ -31,3 +35,5 @@
 - Yahoo `^KS11`에는 배당이 없고, 1998년 12월까지 있던 토요일 거래도 없습니다. 거래량이 0이고 고가와 저가가 같은 행은 뺍니다.
 - Yahoo `069500.KS`는 2009-04 전 시세가 대부분 비어 있어 2008년을 포함한 시험에 쓸 수 없습니다.
 - KRX 정보데이터시스템은 로그인이 필요해 자동으로 받지 않습니다. KOSPI 총수익 자료가 없어 배당은 실험에서 가정합니다.
+- Yahoo SH는 2016년(1:2)과 2024년(1:4)에 병합(역분할)이 있습니다. Yahoo는 종가와 분배금을 같은 비율로 조정하므로, 병합 전 구간의 배당 포함 수익률은 그대로입니다.
+- Yahoo KODEX 인버스에는 2009-11-12와 2009-12-02가 없고, `^KS11`에는 2011-10-04가 없습니다.

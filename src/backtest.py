@@ -1,7 +1,7 @@
 """백테스트 엔진.
 
 일별 데이터(종가, 배당, 현금 수익률)에서 주간·월간 신호를 받아, 정한 시점의 종가에 체결합니다.
-보유 상태는 100% 주식 또는 100% 현금입니다.
+보유 상태는 100% 주식(1), 100% 현금(0), 100% 인버스 ETF(-1, 하락 베팅) 중 하나입니다.
 
 시점 약속:
 - holding_after_close[d]: d일 종가에 체결을 마친 뒤의 보유 상태. d일 종가까지의 정보로 정해집니다.
@@ -24,12 +24,19 @@ class Costs:
     - dividend_withholding: 배당 원천징수율
     - capital_gains_tax: 연간 실현 순이익에 매기는 양도소득세율. 같은 해 손실만 상계하고, 그해 마지막 거래일에 뺍니다.
     - interest_tax: 현금 이자에 매기는 세율 (원천징수로 보고 매일 뺍니다)
+    - inverse_tax: 인버스 ETF 매매차익의 과세 방식
+        - "pooled": 주식 매매차익과 합쳐 연간 실현 순이익에 capital_gains_tax를 매깁니다 (해외 상장 ETF 양도소득세).
+        - "holding_period": 인버스를 팔 때마다 min(매매차익, 과표기준가 증가분) × inverse_gain_tax를 원천징수합니다.
+          손실과 상계하지 않습니다 (국내 상장 인버스 ETF의 보유기간 과세). capital_gains_tax와 함께 쓰지 않습니다.
+    - inverse_gain_tax: "holding_period"의 세율
     """
 
     trade: float = 0.001
     dividend_withholding: float = 0.0
     capital_gains_tax: float = 0.0
     interest_tax: float = 0.0
+    inverse_tax: str = "pooled"
+    inverse_gain_tax: float = 0.0
 
 
 # ---------------------------------------------------------------- 투자 수익률 합성
@@ -69,6 +76,39 @@ def synthetic_index_etf(
     else:
         raise ValueError(f"알 수 없는 현금 가정: {cash}")
     return pd.DataFrame({"close": close, "dividend": dividend, "rf": rf}, index=index)
+
+
+def synthetic_inverse(
+    underlying: pd.DataFrame, rf: pd.Series, expense: float, borrow: float = 0.0, interest_multiple: float = 2.0
+) -> pd.DataFrame:
+    """기초 지수의 일별 배당 포함 수익률로 매일 -1배를 맞추는 인버스 ETF를 합성합니다.
+
+    underlying: close, dividend(배당락일의 주당 배당) 열. rf: 일별 현금 수익률 (같은 인덱스).
+    NAV[t] = NAV[t-1] × (1 − TR[t] + m × rf[t]) × (1 − expense − borrow) ** (경과 일수 / 365.25)
+    - TR[t] = (close[t] + dividend[t]) / close[t-1] − 1. 숏은 배당을 물어 주므로 배당 포함 수익률의 반대입니다.
+    - m × rf[t]: 담보 현금의 이자(1배)와, 선물·스왑 가격에 들어 있는 이자(1배)입니다. 기본 m = 2.
+    - expense: 운용 보수(연율). borrow: 차입·스왑 비용과 그 밖의 추적 차이(연율). 둘 다 달력 일수로 나눠 뺍니다.
+    tax_base: 국내 인버스 ETF의 1주당 과표기준가. 담보 이자 − 보수만 쌓이고, 선물 손익(상장주식 기초 장내파생상품,
+        과세 제외)과 차입 비용은 빠집니다. 담보 이자는 min(m, 1) × rf로 봅니다.
+        tax_base[t] = tax_base[t-1] + NAV[t-1] × (min(m, 1) × rf[t] − expense × 경과 일수 / 365.25)
+    첫날 NAV와 tax_base는 1입니다. 각 날의 값은 그날까지의 데이터로만 계산합니다.
+    """
+    if not underlying.index.equals(rf.index):
+        raise ValueError("기초 지수와 현금 수익률의 날짜가 다릅니다.")
+    close = underlying["close"].to_numpy(dtype=float)
+    dividend = underlying["dividend"].to_numpy(dtype=float)
+    rate = rf.to_numpy(dtype=float)
+    elapsed = np.concatenate([[0.0], np.diff(underlying.index.to_numpy()).astype("timedelta64[D]").astype(float)]) / 365.25
+
+    nav, base = np.empty(len(close)), np.empty(len(close))
+    nav[0] = base[0] = 1.0
+    for t in range(1, len(close)):
+        total_return = (close[t] + dividend[t]) / close[t - 1] - 1
+        nav[t] = nav[t - 1] * (1 - total_return + interest_multiple * rate[t]) * (1 - expense - borrow) ** elapsed[t]
+        base[t] = base[t - 1] + nav[t - 1] * (min(interest_multiple, 1.0) * rate[t] - expense * elapsed[t])
+    if np.isnan(nav).any():
+        raise ValueError("합성 인버스에 빈 값이 있습니다. 기초 지수나 현금 수익률이 빈 날을 확인하세요.")
+    return pd.DataFrame({"close": nav, "tax_base": base}, index=underlying.index)
 
 
 # ---------------------------------------------------------------- 신호
@@ -208,6 +248,11 @@ def moving_average_slope_signal(price: pd.Series, signal_days: pd.DatetimeIndex,
     return pd.Series(signal, index=signal_days, name="signal")
 
 
+def long_short(signal: pd.Series) -> pd.Series:
+    """0/1 신호를 롱/숏 신호로 바꿉니다. 1은 주식(1), 0은 인버스(-1). 준비 기간의 NaN은 그대로 둡니다."""
+    return signal * 2 - 1
+
+
 def holding_from_signal(signal: pd.Series, index: pd.DatetimeIndex, lag: int = 1) -> pd.Series:
     """신호를 각 거래일 종가 직후의 보유 상태로 바꿉니다.
 
@@ -231,18 +276,30 @@ def holding_from_signal(signal: pd.Series, index: pd.DatetimeIndex, lag: int = 1
 
 @dataclass
 class Result:
-    daily: pd.DataFrame  # equity(청산 전), ret, rf, holding(그날 수익률에 적용한 보유 상태), trade, tax
+    daily: pd.DataFrame  # equity(청산 전), ret, rf, holding(그날 수익률에 적용한 보유 상태 1/0/-1), trade, tax
     final_after_liquidation: float  # 기간 끝에 모두 팔고 마지막 해 세금까지 정산한 뒤의 자산
     start_date: pd.Timestamp  # 평가 시작 전날 (자산 1.0 기준일)
-    trades: int
+    trades: int  # 매수와 매도를 각각 한 번으로 센 체결 횟수. 주식에서 인버스로 바꾸면 2회입니다.
 
 
-def run_backtest(data: pd.DataFrame, holding_after_close: pd.Series, start: str, end: str, costs: Costs) -> Result:
+def run_backtest(
+    data: pd.DataFrame, holding_after_close: pd.Series, start: str, end: str, costs: Costs,
+    inverse: pd.DataFrame | None = None,
+) -> Result:
     """평가 시작 전날 종가에 자산 1.0으로 시작해 일별로 계산합니다.
 
     data: close, dividend(주당, 배당락일), rf(일별 현금 수익률) 열. 모두 같은 일별 인덱스.
-    holding_after_close: 각 거래일 종가에 체결을 마친 뒤의 보유 상태 (0 또는 1).
+    holding_after_close: 각 거래일 종가에 체결을 마친 뒤의 보유 상태. 1 주식, 0 현금, -1 인버스.
+    inverse: 보유 상태 -1일 때 들고 있는 인버스 ETF. close(1주 가격) 열, inverse_tax가 "holding_period"면
+        tax_base(1주당 과표기준가) 열도 필요합니다 (synthetic_inverse의 결과). 배당은 없는 것으로 봅니다.
+
+    상태를 바꿀 때는 가진 것을 먼저 팔고 새것을 삽니다. 매도와 매수마다 편도 매매 비용을 냅니다.
+    매수 금액(비용 포함)을 취득가로 두고, 매도 시 순매도액 − 취득가를 실현 이익으로 셉니다.
     """
+    if costs.inverse_tax not in ("pooled", "holding_period"):
+        raise ValueError(f"알 수 없는 인버스 과세 방식: {costs.inverse_tax}")
+    if costs.inverse_tax == "holding_period" and costs.capital_gains_tax > 0:
+        raise ValueError("인버스 보유기간 과세와 연간 양도소득세를 함께 쓰는 경우는 지원하지 않습니다.")
     index = data.index
     days = index[(index >= pd.Timestamp(start)) & (index <= pd.Timestamp(end))]
     if len(days) == 0:
@@ -254,10 +311,24 @@ def run_backtest(data: pd.DataFrame, holding_after_close: pd.Series, start: str,
 
     window = data.loc[start_date:days[-1]]
     holding = holding_after_close.reindex(window.index)
-    if holding.isna().any() or not holding.isin([0.0, 1.0]).all():
-        raise ValueError("평가 기간(시작 전날 포함)에 보유 상태가 0/1이 아닌 날이 있습니다. 신호 준비 기간을 확인하세요.")
+    if holding.isna().any() or not holding.isin([-1.0, 0.0, 1.0]).all():
+        raise ValueError("평가 기간(시작 전날 포함)에 보유 상태가 1/0/-1이 아닌 날이 있습니다. 신호 준비 기간을 확인하세요.")
     if window["rf"].iloc[1:].isna().any():
         raise ValueError("평가 기간에 현금 수익률(rf)이 없는 날이 있습니다.")
+    holding_period_tax = costs.inverse_tax == "holding_period"
+    if (holding == -1.0).any():
+        needed = ["close", "tax_base"] if holding_period_tax else ["close"]
+        if inverse is None:
+            raise ValueError("보유 상태 -1(인버스)이 있는데 인버스 데이터가 없습니다.")
+        if not set(needed) <= set(inverse.columns):
+            raise ValueError(f"인버스 데이터에 {needed} 열이 필요합니다.")
+        frame = inverse.reindex(window.index)
+        if frame[needed].isna().any(axis=None):
+            raise ValueError("평가 기간에 인버스 가격(또는 과표기준가)이 없는 날이 있습니다.")
+        inv_close = frame["close"].to_numpy()
+        inv_base = frame["tax_base"].to_numpy() if holding_period_tax else None
+    else:
+        inv_close = inv_base = None
 
     close = window["close"].to_numpy()
     dividend = window["dividend"].to_numpy() * (1 - costs.dividend_withholding)
@@ -272,43 +343,78 @@ def run_backtest(data: pd.DataFrame, holding_after_close: pd.Series, start: str,
     traded = np.zeros(n, dtype=bool)
     taxes = np.zeros(n)
 
+    # pos: 지금 보유 상태. basis: 취득가(주식·인버스 공통). realized: 그해 연간 과세 대상 실현 손익.
+    # entry: 인버스 매수 때의 (1주 가격, 1주당 과표기준가, 비용을 뺀 투자 금액). 보유기간 과세에 씁니다.
+    pos, basis, realized, trades, entry = 0.0, 0.0, 0.0, 0, None
+
+    def inverse_sale_tax(i: int) -> float:
+        """인버스를 i일 종가에 팔 때의 보유기간 과세. min(매매차익, 과표기준가 증가분) × 세율, 음수면 0."""
+        price, base, invested = entry
+        gain = min(inv_close[i] - price, inv_base[i] - base) / price * invested
+        return costs.inverse_gain_tax * max(0.0, gain)
+
+    def switch(i: int, value: float, want: float) -> float:
+        """i일 종가에 보유 상태를 want로 바꿉니다. 바꾼 뒤의 자산을 돌려줍니다."""
+        nonlocal pos, basis, realized, trades, entry
+        if want == pos:
+            return value
+        if pos != 0.0:
+            proceeds = value * (1 - costs.trade)
+            if pos == -1.0 and holding_period_tax:
+                tax = inverse_sale_tax(i)
+                proceeds -= tax
+                taxes[i] += tax
+            else:
+                realized += proceeds - basis
+            value, basis, entry = proceeds, 0.0, None
+            trades += 1
+        if want != 0.0:
+            basis = value
+            value *= 1 - costs.trade
+            if want == -1.0 and holding_period_tax:
+                entry = (inv_close[i], inv_base[i], value)
+            trades += 1
+        traded[i] = True
+        pos = want
+        return value
+
     # 시작 전날 종가: 보유 상태로 시작하면 진입 비용을 냅니다.
-    value, in_stock, basis, realized, trades = 1.0, False, 0.0, 0.0, 0
-    value, in_stock, basis, realized, did_trade = _trade(value, in_stock, target[0] == 1.0, basis, realized, costs)
-    trades += did_trade
-    equity[0], traded[0] = value, did_trade
+    equity[0] = switch(0, 1.0, target[0])
 
     for i in range(1, n):
         start_value = equity[i - 1]
-        held[i] = 1.0 if in_stock else 0.0
-        if in_stock:
+        held[i] = pos
+        if pos == 1.0:
             value = start_value * (close[i] + dividend[i]) / close[i - 1]
+        elif pos == -1.0:
+            value = start_value * inv_close[i] / inv_close[i - 1]
         else:
             value = start_value * (1 + rf[i] * (1 - costs.interest_tax))
-        value, in_stock, basis, realized, did_trade = _trade(value, in_stock, target[i] == 1.0, basis, realized, costs)
-        trades += did_trade
-        traded[i] = did_trade
+        value = switch(i, value, target[i])
         # 마지막 날의 세금은 청산 손익과 합쳐 아래에서 한 번에 정산합니다.
         if year_end[i] and i < n - 1:
             tax = costs.capital_gains_tax * max(0.0, realized)
             realized = 0.0
-            if in_stock and tax > 0:
-                # 주식을 일부 팔아 세금을 낸 것으로 봅니다. 판 비율만큼 취득가를 줄이고,
+            if pos != 0.0 and tax > 0:
+                # 들고 있는 것을 일부 팔아 세금을 낸 것으로 봅니다. 판 비율만큼 취득가를 줄이고,
                 # 그 부분의 이익은 다음 해 실현 이익으로 넘깁니다. (이 매도의 매매 비용은 무시)
                 sold = tax / value
                 realized = sold * (value - basis)
                 basis *= 1 - sold
             value -= tax
-            taxes[i] = tax
+            taxes[i] += tax
         equity[i] = value
         ret[i] = value / start_value - 1
 
     # 기간 끝 정산: 보유 중이면 팔고, 그해 실현 손익과 청산 손익을 합쳐 한 번만 과세합니다.
-    # 일별 자산(equity)은 이 정산 전 값입니다. 전략과 단순 보유 모두 같은 기준입니다.
+    # 인버스 보유기간 과세는 매도할 때 따로 냅니다. 일별 자산(equity)은 이 정산 전 값입니다.
     final = equity[-1]
-    if in_stock:
+    if pos != 0.0:
         final *= 1 - costs.trade
-        realized += final - basis
+        if pos == -1.0 and holding_period_tax:
+            final -= inverse_sale_tax(n - 1)
+        else:
+            realized += final - basis
     final_tax = costs.capital_gains_tax * max(0.0, realized)
     final -= final_tax
 
@@ -317,16 +423,6 @@ def run_backtest(data: pd.DataFrame, holding_after_close: pd.Series, start: str,
         index=window.index,
     )
     return Result(daily=daily, final_after_liquidation=final, start_date=start_date, trades=trades)
-
-
-def _trade(value: float, in_stock: bool, want_stock: bool, basis: float, realized: float, costs: Costs):
-    """종가에 상태를 바꿉니다. 매수 금액(비용 포함)을 취득가로 두고, 매도 시 순매도액 − 취득가를 실현 이익으로 셉니다."""
-    if want_stock == in_stock:
-        return value, in_stock, basis, realized, False
-    if want_stock:
-        return value * (1 - costs.trade), True, value, realized, True
-    proceeds = value * (1 - costs.trade)
-    return proceeds, False, 0.0, realized + proceeds - basis, True
 
 
 def _last_trading_day_of_year(index: pd.DatetimeIndex) -> pd.Series:
@@ -412,6 +508,7 @@ def metrics(result: Result) -> dict:
         "mdd_trough": trough,
         "mdd_recovery_months": recovery_months,  # NaN이면 기간 안에 회복하지 못함
         "trades_per_year": result.trades / years,
-        "time_in_market": daily["holding"].iloc[1:].mean(),
+        "time_in_market": (daily["holding"].iloc[1:] == 1.0).mean(),  # 주식 보유 비율
+        "time_short": (daily["holding"].iloc[1:] == -1.0).mean(),  # 인버스 보유 비율
         "years": years,
     }

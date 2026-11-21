@@ -6,9 +6,11 @@
 - Ken French: 1개월 국채 월 수익률 RF (1926-07부터)
 - Yahoo: KOSPI 일별 시가, 고가, 저가, 종가 (^KS11, 1996-12-11부터), KODEX 200 종가와 분배금 (069500.KS, 교차 확인용)
 - OECD: 원화 CD 91일물 월평균 금리 (IR3TIB, 1996-01부터)
+- Yahoo: 인버스 ETF SH(2006-06-21부터)와 KODEX 인버스(114800.KS, 2009-09-16부터). 합성 인버스 교차 확인용
 
 실행: python -m src.data (원본으로 표만 다시 만들 때: python -m src.data --offline)
 KOSPI 표는 따로 만듭니다: python -m src.data --kospi (원본으로 다시 만들 때: --kospi --offline)
+인버스 표도 따로 만듭니다: python -m src.data --inverse (--inverse --offline). 현금 수익률은 이미 받은 원본을 씁니다.
 원본은 data/raw/에 두고, 내려받은 시각과 SHA256을 data/raw/manifest.json에 남깁니다.
 """
 
@@ -43,6 +45,10 @@ OECD_KR_RATE = (
 )
 # Yahoo의 KODEX 200은 2009-04 전이 대부분 비어 있습니다. 교차 확인은 설계용 기간 안에서만 합니다.
 KODEX200_RANGE = ("2009-06-01", "2012-12-31")
+# 인버스 ETF: 합성 인버스(-1배)의 교차 확인용. 미국·한국 표와 따로 받습니다.
+# 표본 외 기간을 보지 않도록 표에는 설계용 기간 안의 값만 남깁니다(상장일 ~ 2012년 끝).
+YAHOO_INVERSE_SYMBOLS = {"SH": "yahoo_sh.json", "114800.KS": "yahoo_kodex_inverse.json"}
+INVERSE_RANGE = {"SH": ("2006-06-21", "2012-12-31"), "114800.KS": ("2009-09-16", "2012-12-28")}
 # 가격의 호가 단위 (backtest.snap_to_tick에 씁니다).
 # SPY는 2001-01-26까지 1/64달러 단위, 그 뒤 센트 단위라 둘의 공배수인 1/1600달러를 씁니다. KOSPI 지수는 소수 둘째 자리입니다.
 PRICE_TICK = {"SPY": 1 / 1600, "^KS11": 0.01}
@@ -108,7 +114,7 @@ def download_yahoo(symbol: str) -> Path:
         "includeAdjustedClose": "true",
     }
     url = YAHOO_CHART.format(symbol=requests.utils.quote(symbol, safe=""))
-    name = {**YAHOO_SYMBOLS, **YAHOO_KR_SYMBOLS}[symbol]
+    name = {**YAHOO_SYMBOLS, **YAHOO_KR_SYMBOLS, **YAHOO_INVERSE_SYMBOLS}[symbol]
     return download(url, RAW_DIR / name, params=params, headers={"User-Agent": "Mozilla/5.0"})
 
 
@@ -251,14 +257,22 @@ def parse_yahoo_ohlc(data: dict, tz: ZoneInfo = KR_MARKET_TZ) -> pd.DataFrame:
     return ohlc
 
 
-def parse_yahoo_dividends(data: dict, tz: ZoneInfo = US_MARKET_TZ, between: tuple[str, str] | None = None) -> pd.Series:
+def parse_yahoo_dividends(
+    data: dict, tz: ZoneInfo = US_MARKET_TZ, between: tuple[str, str] | None = None, splits_after: str | None = None
+) -> pd.Series:
     """Yahoo 배당 기록(배당락일 기준, 주당 금액)을 꺼냅니다.
 
     between: 이 날짜 범위의 기록만 씁니다. 시세가 비어 있는 시기의 기록은 날짜가 어긋날 수 있어 범위로 거릅니다.
     분할 기록이 있으면 멈춥니다. 분할이 있는 종목은 배당과 가격의 기준을 맞추는 처리가 따로 필요합니다.
+    splits_after: 이 날짜 뒤의 분할은 허용합니다. Yahoo는 종가와 배당을 같은 비율로 조정하므로, 분할 전 구간의
+        (종가 + 배당) / 전날 종가는 그대로입니다. SH(2016년 1:2, 2024년 1:4 병합)에서 배당률로 확인했습니다.
     """
     events = data["chart"]["result"][0].get("events", {})
-    if events.get("splits"):
+    splits = list(events.get("splits", {}).values())
+    if splits_after is not None:
+        limit = pd.Timestamp(splits_after, tz=tz).timestamp() + 86400
+        splits = [s for s in splits if s["date"] < limit]
+    if splits:
         raise ValueError("분할 기록이 있습니다. 분할 처리를 넣기 전에는 이 종목을 쓰지 않습니다.")
     records = sorted(events.get("dividends", {}).values(), key=lambda r: r["date"])
     if between is not None:
@@ -484,14 +498,49 @@ def main_kospi(offline: bool = False) -> None:
     print(f"CD 금리 마지막 달: {cd_rate.index[-1]}")
 
 
+def main_inverse(offline: bool = False) -> None:
+    """인버스 ETF 교차 확인용 표를 만듭니다. 현금 수익률은 이미 받은 Ken French·OECD 원본을 씁니다(다시 받지 않음).
+
+    표에는 INVERSE_RANGE(설계용 기간 안)의 값만 남깁니다.
+    """
+    if offline:
+        yahoo_paths = {symbol: RAW_DIR / name for symbol, name in YAHOO_INVERSE_SYMBOLS.items()}
+    else:
+        yahoo_paths = {symbol: download_yahoo(symbol) for symbol in YAHOO_INVERSE_SYMBOLS}
+    yahoo = {symbol: json.loads(path.read_text(encoding="utf-8")) for symbol, path in yahoo_paths.items()}
+    us_rf = parse_french_rf(read_french_zip(RAW_DIR / "french_factors.zip"))
+    cd_rate = parse_oecd_rate((RAW_DIR / "oecd_kor_ir3tib.csv").read_text(encoding="utf-8"))
+    # 범위 끝이 2012년이라 끝나지 않은 달이 없습니다. daily_rf에는 범위 다음 달을 넘깁니다.
+    after = pd.Period("2013-01", freq="M")
+
+    first, last = INVERSE_RANGE["SH"]
+    sh = build_etf_daily(
+        parse_yahoo(yahoo["SH"]).loc[first:last],
+        parse_yahoo_dividends(yahoo["SH"], between=INVERSE_RANGE["SH"], splits_after=last),
+        us_rf, after,
+    )
+    first, last = INVERSE_RANGE["114800.KS"]
+    kodex_inverse = build_etf_daily(
+        parse_yahoo(yahoo["114800.KS"], KR_MARKET_TZ).loc[first:last],
+        parse_yahoo_dividends(yahoo["114800.KS"], KR_MARKET_TZ, between=INVERSE_RANGE["114800.KS"]),
+        cd_rate / 12, after,
+    )
+    for name, df in {"sh_daily.csv": sh, "kodex_inverse_daily.csv": kodex_inverse}.items():
+        df.to_csv(DATA_DIR / name)
+        print(f"저장: data/{name} ({df.index[0]:%Y-%m-%d} ~ {df.index[-1]:%Y-%m-%d}, {len(df)}행)")
+
+
 if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(description="시세 데이터 수집과 정리")
     parser.add_argument("--offline", action="store_true", help="내려받지 않고 data/raw/의 원본으로 표만 다시 만듭니다")
     parser.add_argument("--kospi", action="store_true", help="KOSPI 실험용 표만 만듭니다")
+    parser.add_argument("--inverse", action="store_true", help="인버스 ETF(SH, KODEX 인버스) 교차 확인용 표만 만듭니다")
     args = parser.parse_args()
-    if args.kospi:
+    if args.inverse:
+        main_inverse(offline=args.offline)
+    elif args.kospi:
         main_kospi(offline=args.offline)
     else:
         main(offline=args.offline)

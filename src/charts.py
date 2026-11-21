@@ -32,6 +32,10 @@ PRICE = "#2a78d6"
 REFERENCE = "#eb6834"
 HOLDING = "#1baf7a"
 HOLDING_ALPHA = 0.16
+# 인버스(숏) 보유 구간. 기준 팔레트의 4번(노랑)으로, 3번(HOLDING)과 이웃한 쌍이 색각 이상 검사를 통과합니다.
+# 노랑은 옅게 칠하면 잘 안 보여서 투명도를 조금 낮춥니다.
+SHORT = "#eda100"
+SHORT_ALPHA = 0.24
 
 
 @dataclass(frozen=True)
@@ -45,14 +49,15 @@ class Panel:
     percent: bool = False  # True면 0.05를 5%로 표시합니다
 
 
-def holding_spans(exposure: pd.Series) -> list[tuple[pd.Timestamp, pd.Timestamp]]:
+def holding_spans(exposure: pd.Series, side: float = 1.0) -> list[tuple[pd.Timestamp, pd.Timestamp]]:
     """일별 노출을 보유 구간 (매수 체결일, 매도 체결일)의 목록으로 바꿉니다.
 
     exposure: run_backtest의 daily["holding"]. d일 값이 1이면 d-1일 종가부터 d일 종가까지 주식을 들고 있었습니다.
     그래서 노출이 1인 연속 구간 [i, j]는 index[i-1] 종가에 사서 index[j] 종가에 판 구간입니다.
     첫 행은 시작 전날(기준일)이라 노출 값을 쓰지 않습니다. 기간 끝까지 보유했다면 구간 끝은 마지막 날입니다.
+    side: 1이면 주식 보유 구간, -1이면 인버스 보유 구간을 찾습니다.
     """
-    held = exposure.to_numpy()[1:] == 1.0
+    held = exposure.to_numpy()[1:] == side
     padded = np.concatenate([[False], held, [False]])
     edges = np.flatnonzero(padded[1:] != padded[:-1])
     # held[k]는 index[k + 1]의 노출입니다. held[s:e]가 1이면 index[s] ~ index[e] 구간입니다.
@@ -60,12 +65,16 @@ def holding_spans(exposure: pd.Series) -> list[tuple[pd.Timestamp, pd.Timestamp]
 
 
 def metrics_line(strategy: dict, hold: dict) -> str:
-    """부제에 넣을 한 줄 요약. 괄호 안은 같은 비용 가정의 단순 보유입니다."""
+    """부제에 넣을 한 줄 요약. 괄호 안은 같은 비용 가정의 단순 보유입니다. 인버스를 들고 있던 전략은 두 비율을 따로 적습니다."""
+    if strategy.get("time_short", 0) > 0:
+        exposure = f"주식 보유 {strategy['time_in_market']:.0%}, 인버스 보유 {strategy['time_short']:.0%}"
+    else:
+        exposure = f"보유 비율 {strategy['time_in_market']:.0%}"
     return (
         f"CAGR {strategy['cagr']:.2%} (단순 보유 {hold['cagr']:.2%})  ·  "
         f"MDD {strategy['mdd']:.1%} ({hold['mdd']:.1%})  ·  "
         f"샤프 {strategy['sharpe']:.2f} ({hold['sharpe']:.2f})  ·  "
-        f"보유 비율 {strategy['time_in_market']:.0%}  ·  연간 매매 {strategy['trades_per_year']:.1f}회"
+        f"{exposure}  ·  연간 매매 {strategy['trades_per_year']:.1f}회"
     )
 
 
@@ -183,6 +192,7 @@ def holding_chart(
 
     price = clip(price)
     spans = holding_spans(exposure)
+    short_spans = holding_spans(exposure, -1.0)
 
     plt.rcParams.update({"font.family": _korean_font(), "axes.unicode_minus": False})
     # 칸 높이와 머리(제목, 부제, 범례) 높이. 단위는 인치이고, 머리는 부제 줄 수에 따라 늘어납니다.
@@ -200,6 +210,8 @@ def holding_chart(
         _style(ax)
         for start, end in spans:
             ax.axvspan(start, end, color=HOLDING, alpha=HOLDING_ALPHA, linewidth=0)
+        for start, end in short_spans:
+            ax.axvspan(start, end, color=SHORT, alpha=SHORT_ALPHA, linewidth=0)
 
     # 지수 칸
     main = axes[0]
@@ -210,6 +222,8 @@ def holding_chart(
         main.plot(overlay.index, overlay.to_numpy(), color=REFERENCE, linewidth=0.9)
         handles.append(Line2D([], [], color=REFERENCE, linewidth=2, label=overlay_label))
     handles.append(Patch(facecolor=HOLDING, alpha=HOLDING_ALPHA * 2.5, linewidth=0, label="주식 보유 구간"))
+    if short_spans:
+        handles.append(Patch(facecolor=SHORT, alpha=SHORT_ALPHA * 2.5, linewidth=0, label="인버스(-1배) 보유 구간"))
     main.set_yscale("log")
     low, high = price.min(), price.max()
     if overlay is not None:
@@ -221,7 +235,7 @@ def holding_chart(
     main.yaxis.set_minor_formatter(NullFormatter())
     # 범례는 가격선을 가리지 않도록 칸 바깥 위에 둡니다.
     main.legend(handles=handles, loc="lower left", bbox_to_anchor=(0, 1.0), borderaxespad=0.3, borderpad=0,
-                handletextpad=0.5, columnspacing=1.6, frameon=False, fontsize=9.5, labelcolor=INK_SECONDARY, ncols=3)
+                handletextpad=0.5, columnspacing=1.6, frameon=False, fontsize=9.5, labelcolor=INK_SECONDARY, ncols=max(3, len(handles)))
 
     # 보조지표 칸
     for ax, panel in zip(axes[1 : 1 + len(panels)], panels):
