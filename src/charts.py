@@ -36,6 +36,10 @@ HOLDING_ALPHA = 0.16
 # 노랑은 옅게 칠하면 잘 안 보여서 투명도를 조금 낮춥니다.
 SHORT = "#eda100"
 SHORT_ALPHA = 0.24
+# 여러 자산을 구분할 때 쓰는 범주색. 기준 팔레트의 1~5번을 이 순서로 씁니다(돌려 쓰지 않음).
+# 팔레트 문서가 이 순서를 이웃 쌍 기준(선 그래프)으로 색각 이상 검사를 통과했다고 밝힌 8색의 앞 다섯 개입니다.
+# 청록, 노랑, 분홍은 밝은 배경에서 대비가 3:1보다 낮으므로, 쓰는 곳마다 이름을 글자로 함께 적습니다.
+CATEGORICAL = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4"]
 
 
 @dataclass(frozen=True)
@@ -64,8 +68,11 @@ def holding_spans(exposure: pd.Series, side: float = 1.0) -> list[tuple[pd.Times
     return [(exposure.index[s], exposure.index[e]) for s, e in zip(edges[::2], edges[1::2])]
 
 
-def metrics_line(strategy: dict, hold: dict) -> str:
-    """부제에 넣을 한 줄 요약. 괄호 안은 같은 비용 가정의 단순 보유입니다. 인버스를 들고 있던 전략은 두 비율을 따로 적습니다."""
+def metrics_line(strategy: dict, hold: dict, sharpe_label: str = "샤프") -> str:
+    """부제에 넣을 한 줄 요약. 괄호 안은 같은 비용 가정의 단순 보유입니다. 인버스를 들고 있던 전략은 두 비율을 따로 적습니다.
+
+    샤프는 strategy["sharpe"]입니다. 리포트가 다른 정의의 샤프로 판단한다면 sharpe_label에 정의를 적습니다.
+    """
     if strategy.get("time_short", 0) > 0:
         exposure = f"주식 보유 {strategy['time_in_market']:.0%}, 인버스 보유 {strategy['time_short']:.0%}"
     else:
@@ -73,7 +80,7 @@ def metrics_line(strategy: dict, hold: dict) -> str:
     return (
         f"CAGR {strategy['cagr']:.2%} (단순 보유 {hold['cagr']:.2%})  ·  "
         f"MDD {strategy['mdd']:.1%} ({hold['mdd']:.1%})  ·  "
-        f"샤프 {strategy['sharpe']:.2f} ({hold['sharpe']:.2f})  ·  "
+        f"{sharpe_label} {strategy['sharpe']:.2f} ({hold['sharpe']:.2f})  ·  "
         f"{exposure}  ·  연간 매매 {strategy['trades_per_year']:.1f}회"
     )
 
@@ -161,6 +168,110 @@ def _draw_equity(ax: plt.Axes, strategy: pd.Series, hold: pd.Series, strategy_la
               columnspacing=1.6, frameon=False, fontsize=9.5, labelcolor=INK_SECONDARY, ncols=2)
 
 
+def portfolio_chart(
+    path: Path,
+    title: str,
+    subtitle: list[str],
+    levels: dict[str, pd.Series],
+    exposures: dict[str, pd.Series],
+    invested: pd.Series,
+    equity: pd.Series,
+    hold_equity: pd.Series,
+    strategy_label: str,
+) -> Path:
+    """자산마다 따로 판단하는 포트폴리오의 차트. 위에서 아래로 네 칸입니다.
+
+    1. 구성 자산 지수: 자산마다 색 하나, 시작일 = 1, 로그 눈금
+    2. 보유 구간: 자산마다 한 줄, 같은 색. 칠한 곳이 그 자산을 들고 있던 구간입니다.
+    3. 투자 비율: 위험자산에 들어 있던 비율과 그 평균
+    4. 자산 가치: 전략과 단순 보유
+    exposures와 invested, equity, hold_equity는 같은 인덱스(첫 행은 시작일 = 기준일)여야 합니다. exposures의 의미는
+    holding_spans와 같습니다. 자산 수는 CATEGORICAL 색 수 이하입니다.
+    """
+    names = list(levels)
+    if len(names) > len(CATEGORICAL) or list(exposures) != names:
+        raise ValueError("자산 이름이 맞지 않거나 색이 모자랍니다.")
+    index = equity.index
+    for series in [invested, hold_equity, *exposures.values()]:
+        if not series.index.equals(index):
+            raise ValueError("투자 비율, 자산 가치, 보유 상태의 날짜가 다릅니다.")
+    first, last = index[0], index[-1]
+    colors = dict(zip(names, CATEGORICAL))
+
+    plt.rcParams.update({"font.family": _korean_font(), "axes.unicode_minus": False})
+    heights = [4.2, 0.42 * len(names) + 0.5, 1.6, 2.4]
+    header = 1.15 + 0.25 * len(subtitle)
+    height = header + sum(heights) + 0.55
+    fig, axes = plt.subplots(len(heights), 1, sharex=True, figsize=(14, height), facecolor=SURFACE,
+                             gridspec_kw={"height_ratios": heights})
+    # 보유 구간 띠의 자산 이름이 왼쪽에 들어가도록 왼쪽 여백을 holding_chart보다 넓게 둡니다.
+    fig.subplots_adjust(left=0.11, right=0.92, top=1 - header / height, bottom=0.5 / height, hspace=0.22)
+    for ax in axes:
+        _style(ax)
+
+    # 1. 구성 자산 지수
+    top = axes[0]
+    low, high = np.inf, -np.inf
+    for name in names:
+        level = levels[name][(levels[name].index >= first) & (levels[name].index <= last)]
+        level = level / level.iloc[0]
+        top.plot(level.index, level.to_numpy(), color=colors[name], linewidth=1.3, solid_joinstyle="round", label=name)
+        low, high = min(low, level.min()), max(high, level.max())
+    top.set_yscale("log")
+    top.set_ylim(low * 0.9, high * 1.1)
+    top.yaxis.set_major_locator(FixedLocator(_log_ticks(low * 0.9, high * 1.1)))
+    top.yaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v:g}"))
+    top.yaxis.set_minor_locator(NullLocator())
+    top.yaxis.set_minor_formatter(NullFormatter())
+    top.set_title("구성 자산 지수: 시작일 = 1 (로그 눈금)", loc="left", fontsize=10, color=INK, pad=24)
+    top.legend(loc="lower left", bbox_to_anchor=(0, 1.0), borderaxespad=0.3, borderpad=0, handletextpad=0.5,
+               columnspacing=1.6, frameon=False, fontsize=9.5, labelcolor=INK_SECONDARY, ncols=len(names))
+
+    # 2. 보유 구간 띠
+    bands = axes[1]
+    bands.grid(False)
+    for row, name in enumerate(names):
+        y = len(names) - 1 - row
+        bands.axhline(y + 0.5, color=GRID, linewidth=0.6, zorder=0)
+        spans = holding_spans(exposures[name])
+        bars = [(mdates.date2num(s), mdates.date2num(e) - mdates.date2num(s)) for s, e in spans]
+        bands.broken_barh(bars, (y + 0.18, 0.64), facecolors=colors[name], linewidth=0)
+    bands.set_ylim(0, len(names))
+    bands.set_yticks([len(names) - 1 - row + 0.5 for row in range(len(names))], names)
+    bands.tick_params(axis="y", length=0, labelsize=9, labelcolor=INK_SECONDARY)
+    bands.set_title("보유 구간: 칠한 곳이 그 자산을 들고 있던 구간 (나머지는 그 몫을 현금으로)", loc="left", fontsize=10,
+                    color=INK, pad=5)
+
+    # 3. 투자 비율
+    share = axes[2]
+    share.plot(invested.index, invested.to_numpy(), color=INK_SECONDARY, linewidth=1.0, drawstyle="steps-pre")
+    mean = invested.iloc[1:].mean()
+    # 평균선은 자산 색(범주색)과 겹치지 않게 무채색 점선으로 그립니다.
+    share.axhline(mean, color=INK_MUTED, linewidth=1.0, linestyle=(0, (4, 3)))
+    label_at = mtransforms.blended_transform_factory(share.transAxes, share.transData)
+    share.text(1.006, mean, f"평균 {mean:.0%}", transform=label_at, va="center", ha="left", fontsize=9, color=INK_SECONDARY)
+    share.set_ylim(-0.05, 1.05)
+    share.yaxis.set_major_formatter(FuncFormatter(lambda v, _: percent_label(v)))
+    share.set_title("투자 비율: 위험자산에 들어 있던 비율", loc="left", fontsize=10, color=INK, pad=5)
+
+    # 4. 자산 가치
+    _draw_equity(axes[3], start_at_one(equity), start_at_one(hold_equity), strategy_label, heights[3])
+
+    years = (last - first).days / 365.25
+    axes[-1].xaxis.set_major_locator(mdates.YearLocator(base=1 if years <= 10 else 2 if years <= 30 else 5))
+    axes[-1].xaxis.set_minor_locator(mdates.YearLocator(base=1))
+    axes[-1].xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
+    axes[-1].set_xlim(first, last)
+
+    fig.text(0.11, 1 - 0.32 / height, title, fontsize=15, weight="bold", color=INK, va="top")
+    for i, line in enumerate(subtitle):
+        fig.text(0.11, 1 - (0.68 + 0.24 * i) / height, line, fontsize=9.5, color=INK_SECONDARY, va="top")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(path, dpi=150, facecolor=SURFACE)
+    plt.close(fig)
+    return path
+
+
 def holding_chart(
     path: Path,
     title: str,
@@ -174,6 +285,7 @@ def holding_chart(
     equity: pd.Series | None = None,
     hold_equity: pd.Series | None = None,
     strategy_label: str = "",
+    holding_label: str = "주식 보유 구간",
 ) -> Path:
     """가격 선, 보유 구간 음영, 보조지표 칸, 자산 가치 칸을 그려 PNG로 저장합니다.
 
@@ -221,7 +333,7 @@ def holding_chart(
         overlay = clip(overlay)
         main.plot(overlay.index, overlay.to_numpy(), color=REFERENCE, linewidth=0.9)
         handles.append(Line2D([], [], color=REFERENCE, linewidth=2, label=overlay_label))
-    handles.append(Patch(facecolor=HOLDING, alpha=HOLDING_ALPHA * 2.5, linewidth=0, label="주식 보유 구간"))
+    handles.append(Patch(facecolor=HOLDING, alpha=HOLDING_ALPHA * 2.5, linewidth=0, label=holding_label))
     if short_spans:
         handles.append(Patch(facecolor=SHORT, alpha=SHORT_ALPHA * 2.5, linewidth=0, label="인버스(-1배) 보유 구간"))
     main.set_yscale("log")

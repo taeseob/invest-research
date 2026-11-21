@@ -14,6 +14,7 @@ KOSPI 표는 따로 만듭니다: python -m src.data --kospi (원본으로 다�
 원본은 data/raw/에 두고, 내려받은 시각과 SHA256을 data/raw/manifest.json에 남깁니다.
 """
 
+import csv
 import hashlib
 import io
 import json
@@ -23,6 +24,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+import numpy as np
 import pandas as pd
 import requests
 
@@ -49,6 +51,23 @@ KODEX200_RANGE = ("2009-06-01", "2012-12-31")
 # 표본 외 기간을 보지 않도록 표에는 설계용 기간 안의 값만 남깁니다(상장일 ~ 2012년 끝).
 YAHOO_INVERSE_SYMBOLS = {"SH": "yahoo_sh.json", "114800.KS": "yahoo_kodex_inverse.json"}
 INVERSE_RANGE = {"SH": ("2006-06-21", "2012-12-31"), "114800.KS": ("2009-09-16", "2012-12-28")}
+# GTAA 근사 재현용 (journal/2026-11-21-faber-gtaa-reproduction.md). 미국·한국·인버스 표와 따로 받습니다.
+# 연준 H.15 만기 고정 국채 금리(영업일, 1962년부터). FRED DGS10과 같은 자료이고, FRED는 이 환경에서 접속이 끊겨 원출처를 씁니다.
+FED_H15_CMT = (
+    "https://www.federalreserve.gov/datadownload/Output.aspx?rel=H15&series=bf17364827e38702b42a58cf8eaa3f78"
+    "&lastobs=&from=&to=&filetype=csv&label=include&layout=seriescolumn"
+)
+H15_10Y = "RIFLGFCY10_N.B"
+NAREIT_MONTHLY = "https://www.reit.com/sites/default/files/returns/MonthlyHistoricalReturns.xls"
+FRENCH_INT_INDICES = "https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/ftp/F-F_International_Indices.zip"
+FRENCH_INT_INDICES_WOUT_DIV = "https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/ftp/F-F_International_Indices_Wout_Div.zip"
+AQR_COMMODITIES = (
+    "https://www.aqr.com/-/media/AQR/Documents/Insights/Data-Sets/Commodities-for-the-Long-Run-Index-Level-Data-Monthly.xlsx"
+)
+AQR_EW_EXCESS = "Excess return of equal-weight commodities portfolio"
+YAHOO_GTAA_SYMBOLS = {"EFA": "yahoo_efa.json"}  # EAFE 대체 자료의 교차 확인용
+# 교차 확인 표에는 설계용 기간 안의 값만 남깁니다 (표본 외 기간을 보지 않도록).
+EFA_CHECK_END = pd.Period("2012-12", freq="M")
 # 가격의 호가 단위 (backtest.snap_to_tick에 씁니다).
 # SPY는 2001-01-26까지 1/64달러 단위, 그 뒤 센트 단위라 둘의 공배수인 1/1600달러를 씁니다. KOSPI 지수는 소수 둘째 자리입니다.
 PRICE_TICK = {"SPY": 1 / 1600, "^KS11": 0.01, "^GSPC": 0.01}
@@ -114,7 +133,7 @@ def download_yahoo(symbol: str) -> Path:
         "includeAdjustedClose": "true",
     }
     url = YAHOO_CHART.format(symbol=requests.utils.quote(symbol, safe=""))
-    name = {**YAHOO_SYMBOLS, **YAHOO_KR_SYMBOLS, **YAHOO_INVERSE_SYMBOLS}[symbol]
+    name = {**YAHOO_SYMBOLS, **YAHOO_KR_SYMBOLS, **YAHOO_INVERSE_SYMBOLS, **YAHOO_GTAA_SYMBOLS}[symbol]
     return download(url, RAW_DIR / name, params=params, headers={"User-Agent": "Mozilla/5.0"})
 
 
@@ -428,6 +447,225 @@ def build_monthly_avg(shiller: pd.DataFrame, rf: pd.Series, current_month: pd.Pe
     return df
 
 
+# ---------------------------------------------------------------- GTAA 근사 재현용
+
+
+def parse_h15_yield(text: str, identifier: str = H15_10Y) -> pd.Series:
+    """연준 H.15 CSV에서 한 만기의 영업일 금리를 소수(0.0406 = 연 4.06%)로 꺼냅니다. 휴일 표기("ND")와 빈 값은 뺍니다."""
+    rows = list(csv.reader(io.StringIO(text)))
+    ids = next((r for r in rows if r and r[0].startswith("Unique Identifier")), None)
+    header = next((i for i, r in enumerate(rows) if r and r[0] == "Time Period"), None)
+    if ids is None or header is None:
+        raise ValueError("H.15 파일에서 'Unique Identifier'나 'Time Period' 행을 찾지 못했습니다.")
+    if f"H15/H15/{identifier}" not in ids:
+        raise ValueError(f"H.15 파일에 {identifier} 열이 없습니다.")
+    column = rows[header].index(identifier)
+    dates, values = [], []
+    for r in rows[header + 1 :]:
+        value = r[column].strip() if len(r) > column else ""
+        if value in ("", "ND"):
+            continue
+        dates.append(pd.Timestamp(r[0]))
+        values.append(float(value) / 100)
+    series = pd.Series(values, index=pd.DatetimeIndex(dates, name="date"), name=identifier)
+    if not series.index.is_monotonic_increasing or not series.index.is_unique:
+        raise ValueError("H.15 날짜가 중복되거나 순서가 맞지 않습니다.")
+    return series
+
+
+def month_end_value(daily: pd.Series) -> pd.Series:
+    """각 달 마지막 값 (인덱스는 월)."""
+    out = daily.groupby(daily.index.to_period("M")).last()
+    out.index.name = "month"
+    return out
+
+
+def parse_nareit(raw: pd.DataFrame, name: str = "All REITs") -> pd.DataFrame:
+    """reit.com 월간 파일(Index Data 시트, header=None)에서 한 지수의 총수익 지수와 가격 지수를 꺼냅니다.
+
+    머리글은 세 줄입니다: 지수 이름 / Total·Price·Income / Return·Index. 위치는 글자로 찾고 확인합니다.
+    """
+    first = raw.iloc[:, 0].astype(str).str.strip()
+    header_rows = raw.index[first == "Date"]
+    if len(header_rows) != 1:
+        raise ValueError("NAREIT 파일에서 'Date' 머리글 행을 찾지 못했습니다.")
+    h = raw.index.get_loc(header_rows[0])
+    names = raw.iloc[h - 2].astype(str).str.strip()
+    matches = [i for i, v in enumerate(names) if v == name]
+    if len(matches) != 1:
+        raise ValueError(f"NAREIT 파일에서 '{name}' 지수를 찾지 못했습니다.")
+    g = matches[0]
+    expected = {(h - 1, g): "Total", (h, g + 1): "Index", (h - 1, g + 2): "Price", (h, g + 3): "Index"}
+    for (row, col), text in expected.items():
+        if str(raw.iat[row, col]).strip() != text:
+            raise ValueError(f"NAREIT '{name}' 머리글이 예상과 다릅니다: ({row}, {col})는 '{text}'여야 합니다.")
+    body = raw.iloc[h + 1 :]
+    dates = pd.to_datetime(body.iloc[:, 0], errors="coerce")
+    body = body[dates.notna()]
+    out = pd.DataFrame(
+        {"total_index": body.iloc[:, g + 1].astype(float).to_numpy(), "price_index": body.iloc[:, g + 3].astype(float).to_numpy()},
+        index=pd.PeriodIndex(dates[dates.notna()].dt.to_period("M"), name="month"),
+    )
+    check_monthly_continuity(out.index, f"NAREIT {name}")
+    if out.isna().any(axis=None) or (out <= 0).any(axis=None):
+        raise ValueError(f"NAREIT {name}에 비었거나 0 이하인 값이 있습니다.")
+    return out
+
+
+def parse_french_international(text: str) -> pd.Series:
+    """Ken French "International Index" 파일(.Dat)의 첫 구획(달러 기준 가치 가중 월 수익률)에서 Mkt 열을 소수로 꺼냅니다."""
+    lines = text.splitlines()
+    start = next((i for i, l in enumerate(lines) if "Value-Weight Dollar Returns" in l), None)
+    if start is None or lines[start + 2].split()[:1] != ["Mkt"]:
+        raise ValueError("Ken French 해외 지수 파일의 첫 구획(Value-Weight Dollar Returns, Mkt)을 찾지 못했습니다.")
+    months, values = [], []
+    for line in lines[start + 3 :]:
+        parts = line.split()
+        if not parts or not re.fullmatch(r"\d{6}", parts[0]):
+            break  # 첫 구획이 끝났습니다.
+        months.append(pd.Period(f"{parts[0][:4]}-{parts[0][4:]}", freq="M"))
+        values.append(float(parts[1]) / 100)
+    series = pd.Series(values, index=pd.PeriodIndex(months, freq="M", name="month"), name="mkt")
+    check_monthly_continuity(series.index, "Ken French 해외 지수")
+    if (series <= -0.99).any():
+        raise ValueError("Ken French 해외 지수에 -99% 이하(결측 표기)가 있습니다.")
+    return series
+
+
+def read_french_dat(path: Path, name: str) -> str:
+    with zipfile.ZipFile(path) as archive:
+        return archive.read(name).decode("latin-1")
+
+
+def parse_aqr_commodities(raw: pd.DataFrame, column: str = AQR_EW_EXCESS) -> pd.Series:
+    """AQR "Commodities for the Long Run" 첫 시트(header=None)에서 한 열의 월 수익률을 꺼냅니다."""
+    cells = raw.astype(str).apply(lambda col: col.str.strip())
+    found = [(r, c) for r, c in zip(*np.nonzero((cells == column).to_numpy()))]
+    if len(found) != 1:
+        raise ValueError(f"AQR 파일에서 '{column}' 열을 찾지 못했습니다.")
+    row, col = found[0]
+    body = raw.iloc[row + 1 :]
+    dates = pd.to_datetime(body.iloc[:, 0], errors="coerce")
+    body = body[dates.notna()]
+    series = pd.Series(
+        body.iloc[:, col].astype(float).to_numpy(),
+        index=pd.PeriodIndex(dates[dates.notna()].dt.to_period("M"), name="month"),
+        name="commodity_er",
+    )
+    check_monthly_continuity(series.index, "AQR 원자재")
+    if series.isna().any():
+        raise ValueError("AQR 원자재 수익률에 빈 값이 있습니다.")
+    return series
+
+
+def parse_yahoo_adjclose(data: dict, tz: ZoneInfo = US_MARKET_TZ) -> pd.Series:
+    """Yahoo의 수정 종가(분할과 배당 반영). 교차 확인에만 씁니다."""
+    try:
+        result = data["chart"]["result"][0]
+        adjclose = result["indicators"]["adjclose"][0]["adjclose"]
+    except (KeyError, IndexError, TypeError) as error:
+        raise ValueError("Yahoo 응답에 수정 종가가 없습니다.") from error
+    series = pd.Series(adjclose, index=yahoo_dates(result["timestamp"], tz), name="adjclose", dtype="float64").dropna()
+    return series[~series.index.duplicated(keep="last")].sort_index()
+
+
+def build_gtaa_monthly(
+    month_end: pd.DataFrame, eafe: pd.Series, eafe_price: pd.Series, bond_yield: pd.Series,
+    commodity_er: pd.Series, reits: dict[str, pd.DataFrame], current_month: pd.Period,
+) -> pd.DataFrame:
+    """GTAA 근사 재현용 월간 표. 열은 자산마다 총수익률(_tr)과 신호용 가격 수익률(_pr), 그리고 현금(rf)입니다.
+
+    - us_stock: S&P 500 월말 종가 + Shiller 배당 (build_month_end의 표).
+      us_stock_sig_tr은 신호용 총수익률로, 배당에 12개월 전 D를 씁니다. Shiller D는 직선 보간이라 최근 값에
+      앞으로의 배당이 섞여 있기 때문입니다 (S&P 500 재현과 같은 규칙). 수익률 계산에는 쓰지 않습니다.
+    - eafe: Ken French 해외 지수 전체(EAFE + 캐나다 비중), 가격 수익률은 배당 제외 파일
+    - bond: 10년 국채 합성 (src/bonds.py). bond_yield는 월말 금리
+    - commodity: AQR 동일 비중 원자재 선물. 총수익률 = 초과수익률 + 현금, 가격 수익률 = 초과수익률
+    - reit_<이름>: NAREIT 지수들. 첫째가 기본입니다.
+    current_month와 그 뒤는 끝나지 않은 달이라 뺍니다.
+    """
+    from src.bonds import par_bond_monthly_returns
+    from src.monthly import total_return_signal_index
+
+    bond = par_bond_monthly_returns(bond_yield)
+    months = pd.period_range("1971-12", current_month - 1, freq="M", name="month")
+    rf = month_end["rf"].reindex(months)
+    # 12개월 전 D가 있는 첫 달부터 신호용 지수를 만듭니다.
+    first_lagged = month_end["dividend"].first_valid_index() + 12
+    signal_level = total_return_signal_index(month_end["close"].loc[first_lagged:].dropna(), month_end["dividend"], 12)
+    table = pd.DataFrame(index=months)
+    table["us_stock_tr"] = month_end["total_return"].reindex(months)
+    table["us_stock_pr"] = month_end["price_return"].reindex(months)
+    table["us_stock_sig_tr"] = (signal_level / signal_level.shift(1) - 1).reindex(months)
+    table["eafe_tr"] = eafe.reindex(months)
+    table["eafe_pr"] = eafe_price.reindex(months)
+    table["bond_tr"] = bond["total_return"].reindex(months)
+    table["bond_pr"] = bond["price_return"].reindex(months)
+    table["bond_yield"] = bond_yield.reindex(months)
+    table["commodity_tr"] = commodity_er.reindex(months) + rf
+    table["commodity_pr"] = commodity_er.reindex(months)
+    for key, index in reits.items():
+        table[f"{key}_tr"] = (index["total_index"] / index["total_index"].shift(1) - 1).reindex(months)
+        table[f"{key}_pr"] = (index["price_index"] / index["price_index"].shift(1) - 1).reindex(months)
+    table["rf"] = rf
+    return table
+
+
+def main_gtaa(offline: bool = False) -> None:
+    """GTAA 근사 재현용 표를 만듭니다. S&P 500과 현금은 이미 받은 원본(^GSPC, Shiller, Ken French)을 씁니다(다시 받지 않음)."""
+    paths = {
+        "h15": RAW_DIR / "fed_h15_cmt.csv",
+        "nareit": RAW_DIR / "nareit_monthly.xls",
+        "french_int": RAW_DIR / "french_international_indices.zip",
+        "french_int_wout_div": RAW_DIR / "french_international_indices_wout_div.zip",
+        "aqr": RAW_DIR / "aqr_commodities_long_run.xlsx",
+    }
+    if not offline:
+        download(FED_H15_CMT, paths["h15"], headers={"User-Agent": "Mozilla/5.0"})
+        # 브라우저처럼 보이는 머리글을 보내면 reit.com은 파일 대신 브라우저 확인 페이지(HTML)를 줍니다. 기본 머리글로 받습니다.
+        download(NAREIT_MONTHLY, paths["nareit"])
+        download(FRENCH_INT_INDICES, paths["french_int"])
+        download(FRENCH_INT_INDICES_WOUT_DIV, paths["french_int_wout_div"])
+        download(AQR_COMMODITIES, paths["aqr"], headers={"User-Agent": "Mozilla/5.0"})
+        for symbol in YAHOO_GTAA_SYMBOLS:
+            download_yahoo(symbol)
+    # 기준 시점은 H.15 원본을 내려받은 시각입니다. 그달과 그 뒤는 끝나지 않은 달이라 뺍니다.
+    manifest = json.loads(MANIFEST_PATH.read_text(encoding="utf-8"))
+    now = datetime.fromisoformat(manifest[paths["h15"].name]["downloaded_at_utc"]).astimezone(US_MARKET_TZ)
+    current_month = current_us_month(now)
+
+    # S&P 500 월말 표: main()과 같은 원본으로 다시 만듭니다. 기준 시점은 main()처럼 ^GSPC 원본을 내려받은 시각입니다
+    # (그 뒤의 달은 S&P 500 값이 비어 있습니다).
+    gspc_now = datetime.fromisoformat(manifest[YAHOO_SYMBOLS["^GSPC"]]["downloaded_at_utc"]).astimezone(US_MARKET_TZ)
+    shiller = parse_shiller(pd.read_excel(RAW_DIR / "shiller_ie_data.xls", sheet_name="Data", header=None))
+    gspc = parse_yahoo(json.loads((RAW_DIR / YAHOO_SYMBOLS["^GSPC"]).read_text(encoding="utf-8")))
+    rf = parse_french_rf(read_french_zip(RAW_DIR / "french_factors.zip"))
+    month_end = build_month_end(gspc[gspc.index.date < gspc_now.date()], shiller, rf, current_us_month(gspc_now))
+
+    bond_yield = month_end_value(parse_h15_yield(paths["h15"].read_text(encoding="utf-8")))
+    bond_yield = bond_yield[bond_yield.index < current_month]
+    check_monthly_continuity(bond_yield.index, "H.15 10년 금리")
+    eafe = parse_french_international(read_french_dat(paths["french_int"], "Ind_all.Dat"))
+    eafe_price = parse_french_international(read_french_dat(paths["french_int_wout_div"], "Ind_all.Dat"))
+    commodity_er = parse_aqr_commodities(pd.read_excel(paths["aqr"], sheet_name=0, header=None))
+    nareit_raw = pd.read_excel(paths["nareit"], sheet_name="Index Data", header=None)
+    reits = {key: parse_nareit(nareit_raw, name) for key, name in
+             [("reit", "All REITs"), ("reit_all_equity", "All Equity REITs"), ("reit_equity", "Equity REITs")]}
+
+    table = build_gtaa_monthly(month_end, eafe, eafe_price, bond_yield, commodity_er, reits, current_month)
+    efa = month_end_value(parse_yahoo_adjclose(json.loads((RAW_DIR / YAHOO_GTAA_SYMBOLS["EFA"]).read_text(encoding="utf-8"))))
+    efa = efa[efa.index <= EFA_CHECK_END]
+    efa_table = pd.DataFrame({"efa_tr": efa / efa.shift(1) - 1, "eafe_proxy_tr": table["eafe_tr"].reindex(efa.index)})
+
+    for name, df in {"gtaa_monthly.csv": table, "efa_monthly.csv": efa_table}.items():
+        df.to_csv(DATA_DIR / name)
+        print(f"저장: data/{name} ({df.index[0]} ~ {df.index[-1]}, {len(df)}행)")
+    print("열마다 값이 있는 첫 달과 마지막 달:")
+    for column in table.columns:
+        valid = table[column].dropna()
+        print(f"  {column}: {valid.index[0]} ~ {valid.index[-1]}")
+
+
 def main(offline: bool = False) -> None:
     if offline:
         # 이미 받은 원본으로 표만 다시 만듭니다.
@@ -549,8 +787,11 @@ if __name__ == "__main__":
     parser.add_argument("--offline", action="store_true", help="내려받지 않고 data/raw/의 원본으로 표만 다시 만듭니다")
     parser.add_argument("--kospi", action="store_true", help="KOSPI 실험용 표만 만듭니다")
     parser.add_argument("--inverse", action="store_true", help="인버스 ETF(SH, KODEX 인버스) 교차 확인용 표만 만듭니다")
+    parser.add_argument("--gtaa", action="store_true", help="GTAA 근사 재현용 5자산 월간 표만 만듭니다")
     args = parser.parse_args()
-    if args.inverse:
+    if args.gtaa:
+        main_gtaa(offline=args.offline)
+    elif args.inverse:
         main_inverse(offline=args.offline)
     elif args.kospi:
         main_kospi(offline=args.offline)

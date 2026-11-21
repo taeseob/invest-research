@@ -149,6 +149,79 @@ def monthly_metrics(ret: pd.Series, rf: pd.Series, held: pd.Series | None = None
     return out
 
 
+def level_from_returns(returns: pd.Series) -> pd.Series:
+    """월 수익률(인덱스 월)을 지수로 바꿉니다. 첫 수익률이 있는 달의 전달을 1로 둡니다.
+
+    첫 값 앞의 빈 달은 버리고, 그 뒤에 빈 달이 있으면 멈춥니다(조용히 잇지 않음).
+    """
+    valid = returns.dropna()
+    if valid.empty:
+        raise ValueError("수익률이 없습니다.")
+    inside = returns.loc[valid.index[0] : valid.index[-1]]
+    if inside.isna().any():
+        raise ValueError(f"수익률 중간에 빈 달이 있습니다: {inside[inside.isna()].index[0]}")
+    level = (1 + inside).cumprod()
+    base = pd.Series([1.0], index=pd.PeriodIndex([inside.index[0] - 1], freq="M"))
+    return pd.concat([base, level]).rename(returns.name)
+
+
+def signals_from_returns(signal_returns: pd.DataFrame, window: int) -> pd.DataFrame:
+    """열마다 월 수익률을 지수로 바꾸고, t월 말 지수가 최근 window개 월말 값(그달 포함)의 평균보다 높으면 1.
+
+    반환 값의 t월은 t월 말까지의 수익률만 씁니다. 준비 기간은 NaN입니다.
+    """
+    return pd.DataFrame({
+        column: monthly_series_signal(level_from_returns(signal_returns[column]), window).reindex(signal_returns.index)
+        for column in signal_returns.columns
+    })
+
+
+def held_from_signals(signals: pd.DataFrame) -> pd.DataFrame:
+    """t월 동안의 보유 상태 = t-1월 말 신호. 월말 종가에 신호를 보고 같은 날 체결한 뒤 한 달을 들고 갑니다."""
+    expected = pd.period_range(signals.index[0], signals.index[-1], freq="M")
+    if not signals.index.equals(expected):
+        raise ValueError("신호에 빠진 달이 있습니다.")
+    return signals.shift(1)
+
+
+def equal_weight_portfolio(asset_return: pd.DataFrame, held: pd.DataFrame, rf: pd.Series, trade_cost: float = 0.0) -> pd.DataFrame:
+    """자산마다 1/N 비중의 포트폴리오. 매달 초(전달 말 종가)에 1/N로 다시 맞춥니다.
+
+    held[i][t] = 1이면 t월 동안 자산 i를 들고, 0이면 그 몫을 현금으로 둡니다. held는 t-1월 말까지의 정보로 정한
+    값이어야 합니다(보통 신호를 한 달 미룬 것). 단순 보유는 held가 모두 1입니다.
+    - gross[t] = mean_i(held_i[t] × r_i[t] + (1 − held_i[t]) × rf[t])
+    - 비용: t월을 시작할 때 위험자산 비중을 목표(held_i[t] / N)로 맞추며 사고판 양 × trade_cost.
+      직전 달 뒤 움직인 비중은 d_i = w_i[t-1] × (1 + r_i[t-1]) / (1 + gross[t-1])입니다.
+      첫 달은 현금에서 시작하므로(d = 0) 진입 비용을 냅니다. 현금은 거래 비용이 없습니다.
+    - ret[t] = (1 − cost[t]) × (1 + gross[t]) − 1
+    """
+    if not (asset_return.index.equals(held.index) and asset_return.index.equals(rf.index)):
+        raise ValueError("자산 수익률, 보유 상태, 현금 수익률의 월이 다릅니다.")
+    if list(asset_return.columns) != list(held.columns):
+        raise ValueError("자산 수익률과 보유 상태의 열이 다릅니다.")
+    if asset_return.isna().any(axis=None) or rf.isna().any():
+        raise ValueError("평가 기간에 빈 수익률이 있습니다.")
+    if held.isna().any(axis=None) or not held.isin([0.0, 1.0]).all(axis=None):
+        raise ValueError("보유 상태는 0/1이어야 합니다.")
+
+    n = asset_return.shape[1]
+    r = asset_return.to_numpy(dtype=float)
+    h = held.to_numpy(dtype=float)
+    cash = rf.to_numpy(dtype=float)
+    gross = (h * r + (1 - h) * cash[:, None]).mean(axis=1)
+
+    target = h / n
+    drifted = np.zeros_like(target)
+    drifted[1:] = target[:-1] * (1 + r[:-1]) / (1 + gross[:-1])[:, None]
+    turnover = np.abs(target - drifted).sum(axis=1)
+    cost = trade_cost * turnover
+    ret = (1 - cost) * (1 + gross) - 1
+    return pd.DataFrame(
+        {"ret": ret, "gross": gross, "cost": cost, "turnover": turnover, "invested": h.mean(axis=1)},
+        index=asset_return.index,
+    )
+
+
 def switch_months(signal: pd.Series) -> pd.DataFrame:
     """신호가 바뀐 달의 목록. 매도 신호를 낸 달이 원문 본문의 매도 시점과 같은지 볼 때 씁니다."""
     values = signal.dropna()

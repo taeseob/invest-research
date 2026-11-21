@@ -2,7 +2,7 @@
 
 내려받은 시세 데이터를 두는 폴더입니다. 이 README를 빼고는 저장소에 올라가지 않습니다.
 
-데이터는 언제든 `src/`의 수집 코드로 다시 받을 수 있어야 합니다. 모두 `python -m src.data`로 만들고, 이미 받은 원본으로 표만 다시 만들 때는 `python -m src.data --offline`을 씁니다. KOSPI 표는 `python -m src.data --kospi`로 따로 만듭니다 (`--kospi --offline` 가능). 인버스 ETF 표는 `python -m src.data --inverse`로 따로 만듭니다 (`--inverse --offline` 가능, 현금 수익률은 이미 받은 Ken French·OECD 원본 사용).
+데이터는 언제든 `src/`의 수집 코드로 다시 받을 수 있어야 합니다. 모두 `python -m src.data`로 만들고, 이미 받은 원본으로 표만 다시 만들 때는 `python -m src.data --offline`을 씁니다. KOSPI 표는 `python -m src.data --kospi`로 따로 만듭니다 (`--kospi --offline` 가능). 인버스 ETF 표는 `python -m src.data --inverse`로 따로 만듭니다 (`--inverse --offline` 가능, 현금 수익률은 이미 받은 Ken French·OECD 원본 사용). GTAA 근사 재현용 5자산 표는 `python -m src.data --gtaa`로 따로 만듭니다 (`--gtaa --offline` 가능, S&P 500과 현금은 이미 받은 ^GSPC·Shiller·Ken French 원본 사용).
 
 | 파일 | 내용 |
 |---|---|
@@ -26,6 +26,13 @@
 | `raw/yahoo_kodex_inverse.json` | Yahoo `114800.KS` KODEX 인버스 일별 시세 원본 |
 | `sh_daily.csv` | SH 종가, 분배금, 수익률, 일별 RF (2006-06-21 ~ 2012-12-31만. 합성 인버스 교차 확인용) |
 | `kodex_inverse_daily.csv` | KODEX 인버스 종가, 수익률, 일별 CD 금리 (2009-09-16 ~ 2012-12-28만. 합성 인버스 교차 확인용) |
+| `raw/fed_h15_cmt.csv` | 연준 H.15 만기 고정 국채 금리 원본 (영업일, 1962년부터. FRED DGS10과 같은 자료) |
+| `raw/nareit_monthly.xls` | FTSE Nareit 월간 지수 원본 (reit.com, 1971-12부터) |
+| `raw/french_international_indices.zip`, `raw/french_international_indices_wout_div.zip` | Ken French 해외 지수 원본 (배당 포함·제외, 1975-01부터) |
+| `raw/aqr_commodities_long_run.xlsx` | AQR "Commodities for the Long Run" 원본 (동일 비중 원자재 선물, 1877년부터) |
+| `raw/yahoo_efa.json` | Yahoo EFA(iShares MSCI EAFE) 일별 시세 원본 (EAFE 대체 자료 교차 확인용) |
+| `gtaa_monthly.csv` | **GTAA 근사 재현용.** 자산마다 총수익률(`_tr`)과 신호용 가격 수익률(`_pr`), S&P 500 신호용 총수익률(`us_stock_sig_tr`, 12개월 전 배당), 10년 국채 월말 금리, 리츠 세 지수, RF |
+| `efa_monthly.csv` | EFA와 EAFE 대체 자료의 월 수익률 (2001-08 ~ 2012-12만. 교차 확인용) |
 
 주의:
 
@@ -37,3 +44,6 @@
 - KRX 정보데이터시스템은 로그인이 필요해 자동으로 받지 않습니다. KOSPI 총수익 자료가 없어 배당은 실험에서 가정합니다.
 - Yahoo SH는 2016년(1:2)과 2024년(1:4)에 병합(역분할)이 있습니다. Yahoo는 종가와 분배금을 같은 비율로 조정하므로, 병합 전 구간의 배당 포함 수익률은 그대로입니다.
 - Yahoo KODEX 인버스에는 2009-11-12와 2009-12-02가 없고, `^KS11`에는 2011-10-04가 없습니다.
+- GTAA 표의 EAFE와 원자재는 대체 자료입니다. Ken French 해외 지수는 EAFE에 캐나다를 더한 비중으로 국가를 가중하고, AQR 원자재는 GSCI가 아니라 동일 비중입니다. 10년 국채는 금리로 합성한 값입니다.
+- reit.com은 브라우저처럼 보이는 요청 머리글을 보내면 파일 대신 브라우저 확인 페이지(HTML)를 줍니다. 수집 코드는 기본 머리글로 받습니다.
+- FRED(fred.stlouisfed.org)는 이 환경에서 연결이 끊겨, 같은 자료를 연준 H.15 원출처에서 받습니다.
