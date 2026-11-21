@@ -222,6 +222,64 @@ def equal_weight_portfolio(asset_return: pd.DataFrame, held: pd.DataFrame, rf: p
     )
 
 
+def trailing_return(returns: pd.DataFrame | pd.Series, months: int):
+    """t월 말 기준 최근 months개월(t월 포함)의 누적 수익률. 준비 기간과 빈 달이 낀 구간은 NaN입니다."""
+    if months < 1:
+        raise ValueError("months는 1 이상이어야 합니다.")
+    return np.expm1(np.log1p(returns).rolling(months).sum())
+
+
+def dual_momentum_choice(m_us: pd.Series, m_ex: pd.Series, m_cash: pd.Series, absolute: str | None = "us") -> pd.Series:
+    """t월 말 듀얼 모멘텀 선택 ("us_stock", "ex_us", "bond"). 인자는 t월 말 12개월 수익률 등 같은 인덱스의 값입니다.
+
+    - 상대 모멘텀: m_us >= m_ex면 미국 주식, 아니면 미국 외 주식 (같으면 미국 주식)
+    - absolute="us": m_us > m_cash일 때만 상대 모멘텀의 선택을 들고, 아니면 채권 (S&P 500 기준 절대 모멘텀)
+    - absolute="selected": 상대 모멘텀으로 고른 자산의 m이 m_cash보다 클 때만 그 자산, 아니면 채권
+    - absolute=None: 절대 모멘텀 없음 (늘 상대 모멘텀의 선택)
+    셋 중 하나라도 빈 달은 결측값입니다 (pandas가 None을 NaN으로 저장할 수 있으니 pd.isna로 확인합니다).
+    """
+    if not (m_us.index.equals(m_ex.index) and m_us.index.equals(m_cash.index)):
+        raise ValueError("12개월 수익률의 인덱스가 다릅니다.")
+    ready = (m_us.notna() & m_ex.notna() & m_cash.notna()).to_numpy()
+    us, ex, cash = m_us.to_numpy(), m_ex.to_numpy(), m_cash.to_numpy()
+    relative = np.where(us >= ex, "us_stock", "ex_us")
+    if absolute == "us":
+        risk_on = us > cash
+    elif absolute == "selected":
+        risk_on = np.where(us >= ex, us, ex) > cash
+    elif absolute is None:
+        risk_on = np.ones(len(us), dtype=bool)
+    else:
+        raise ValueError(f"알 수 없는 절대 모멘텀 기준: {absolute}")
+    choice = np.where(risk_on, relative, "bond").astype(object)
+    choice[~ready] = None
+    return pd.Series(choice, index=m_us.index, name="choice")
+
+
+def rotation_returns(asset_return: pd.DataFrame, held: pd.Series, trade_cost: float = 0.0) -> pd.DataFrame:
+    """한 번에 한 자산만 100% 드는 전략의 월 수익률.
+
+    held[t]: t월 동안 드는 자산의 열 이름 (t-1월 말까지의 정보로 정한 값, 보통 선택을 한 달 미룬 것).
+    gross[t] = asset_return[held[t]][t]. 비용은 t월을 시작할 때 냅니다. 첫 달은 매수 한 번(trade_cost),
+    자산을 바꾼 달은 팔고 사서 2 × trade_cost입니다. ret[t] = (1 − cost[t]) × (1 + gross[t]) − 1
+    """
+    if not asset_return.index.equals(held.index):
+        raise ValueError("자산 수익률과 보유 자산의 월이 다릅니다.")
+    if held.isna().any() or not held.isin(asset_return.columns).all():
+        raise ValueError("보유 자산이 비었거나 자산 수익률에 없는 이름이 있습니다.")
+    columns = asset_return.columns.get_indexer(held.to_numpy())
+    values = asset_return.to_numpy(dtype=float)
+    gross = values[np.arange(len(held)), columns]
+    if np.isnan(gross).any():
+        raise ValueError("보유 자산의 수익률이 빈 달이 있습니다.")
+    switched = np.concatenate([[False], held.to_numpy()[1:] != held.to_numpy()[:-1]])
+    cost = np.where(switched, 2 * trade_cost, 0.0)
+    cost[0] = trade_cost
+    ret = (1 - cost) * (1 + gross) - 1
+    return pd.DataFrame({"ret": ret, "gross": gross, "cost": cost, "switched": switched, "held": held.to_numpy()},
+                        index=asset_return.index)
+
+
 def switch_months(signal: pd.Series) -> pd.DataFrame:
     """신호가 바뀐 달의 목록. 매도 신호를 낸 달이 원문 본문의 매도 시점과 같은지 볼 때 씁니다."""
     values = signal.dropna()

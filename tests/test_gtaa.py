@@ -67,6 +67,40 @@ def test_bond_matches_cash_flow_formula_on_random_path():
         assert out["total_return"].iloc[t] == pytest.approx(price - 1, rel=1e-12, abs=1e-14)
 
 
+def test_five_year_bond_matches_cash_flow_formula():
+    """5년 만기(반기 10번)도 현금흐름을 하나씩 할인한 값과 같은지 (듀얼 모멘텀의 채권 대체 자료)."""
+    rng = np.random.default_rng(3)
+    months = pd.period_range("1980-01", periods=20, freq="M")
+    yields = pd.Series(rng.uniform(0.01, 0.15, 20), index=months)
+    out = par_bond_monthly_returns(yields, 5.0)
+    for t in range(1, 20):
+        coupon, y = yields.iloc[t - 1], yields.iloc[t]
+        price = sum(coupon / 2 / (1 + y / 2) ** (k - 1 / 6) for k in range(1, 11)) + 1 / (1 + y / 2) ** (10 - 1 / 6)
+        assert out["total_return"].iloc[t] == pytest.approx(price - 1, rel=1e-12, abs=1e-14)
+
+
+def test_build_dual_momentum_monthly_joins_sources_by_month():
+    from src.data import build_dual_momentum_monthly
+
+    months = pd.period_range("1960-01", "1973-06", freq="M")
+    rng = np.random.default_rng(9)
+    close = pd.Series(100 * np.cumprod(1 + rng.normal(0.005, 0.03, len(months))), index=months)
+    dividend = pd.Series(np.linspace(2.0, 4.0, len(months)), index=months)
+    rf = pd.Series(rng.uniform(0.002, 0.008, len(months)), index=months)  # 달마다 다르게 (한 달 밀림을 잡도록)
+    month_end = pd.DataFrame({"close": close, "dividend": dividend, "rf": rf,
+                              "total_return": (close + dividend / 12) / close.shift(1) - 1})
+    ex_us = pd.Series(rng.normal(0.01, 0.04, len(months)), index=months)
+    y5, y10 = pd.Series(rng.uniform(0.03, 0.08, len(months)), index=months), pd.Series(0.06, index=months)
+    table = build_dual_momentum_monthly(month_end, ex_us, y5, y10, pd.Period("1973-06", freq="M"))
+    assert table.index[0] == pd.Period("1971-12", "M") and table.index[-1] == pd.Period("1973-05", "M")
+    t = pd.Period("1972-05", "M")
+    assert table.loc[t, "ex_us_tr"] == pytest.approx(ex_us[t])
+    assert table.loc[t, "bond_tr"] == pytest.approx(par_bond_monthly_returns(y5, 5.0).loc[t, "total_return"])
+    assert table.loc[t, "bond10_tr"] == pytest.approx(par_bond_monthly_returns(y10, 10.0).loc[t, "total_return"])
+    assert table.loc[t, "us_stock_sig_tr"] == pytest.approx((close[t] + dividend[t - 12] / 12) / close[t - 1] - 1)
+    assert table.loc[t, "rf"] == pytest.approx(rf[t])
+
+
 def test_bond_rejects_missing_month():
     with pytest.raises(ValueError):
         par_bond_monthly_returns(pd.Series([0.05, 0.05], index=pd.PeriodIndex(["2000-01", "2000-03"], freq="M")))

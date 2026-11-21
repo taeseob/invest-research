@@ -28,6 +28,8 @@ import numpy as np
 import pandas as pd
 import requests
 
+from src.bonds import par_bond_monthly_returns
+
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 RAW_DIR = DATA_DIR / "raw"
 MANIFEST_PATH = RAW_DIR / "manifest.json"
@@ -68,6 +70,11 @@ AQR_EW_EXCESS = "Excess return of equal-weight commodities portfolio"
 YAHOO_GTAA_SYMBOLS = {"EFA": "yahoo_efa.json"}  # EAFE 대체 자료의 교차 확인용
 # 교차 확인 표에는 설계용 기간 안의 값만 남깁니다 (표본 외 기간을 보지 않도록).
 EFA_CHECK_END = pd.Period("2012-12", freq="M")
+# 듀얼 모멘텀 근사 재현용 (journal/2026-11-21-antonacci-dual-momentum-reproduction.md). GTAA 때 받은 원본을 다시 쓰고,
+# 교차 확인용 ETF만 새로 받습니다. 교차 확인 표에는 설계용 기간(2013-12까지)만 남깁니다.
+H15_5Y = "RIFLGFCY05_N.B"
+YAHOO_DM_SYMBOLS = {"ACWX": "yahoo_acwx.json", "AGG": "yahoo_agg.json"}
+DM_CHECK_END = pd.Period("2013-12", freq="M")
 # 가격의 호가 단위 (backtest.snap_to_tick에 씁니다).
 # SPY는 2001-01-26까지 1/64달러 단위, 그 뒤 센트 단위라 둘의 공배수인 1/1600달러를 씁니다. KOSPI 지수는 소수 둘째 자리입니다.
 PRICE_TICK = {"SPY": 1 / 1600, "^KS11": 0.01, "^GSPC": 0.01}
@@ -133,7 +140,7 @@ def download_yahoo(symbol: str) -> Path:
         "includeAdjustedClose": "true",
     }
     url = YAHOO_CHART.format(symbol=requests.utils.quote(symbol, safe=""))
-    name = {**YAHOO_SYMBOLS, **YAHOO_KR_SYMBOLS, **YAHOO_INVERSE_SYMBOLS, **YAHOO_GTAA_SYMBOLS}[symbol]
+    name = {**YAHOO_SYMBOLS, **YAHOO_KR_SYMBOLS, **YAHOO_INVERSE_SYMBOLS, **YAHOO_GTAA_SYMBOLS, **YAHOO_DM_SYMBOLS}[symbol]
     return download(url, RAW_DIR / name, params=params, headers={"User-Agent": "Mozilla/5.0"})
 
 
@@ -569,6 +576,19 @@ def parse_yahoo_adjclose(data: dict, tz: ZoneInfo = US_MARKET_TZ) -> pd.Series:
     return series[~series.index.duplicated(keep="last")].sort_index()
 
 
+def sp500_signal_returns(month_end: pd.DataFrame) -> pd.Series:
+    """신호용 S&P 500 월 총수익률: (close[t] + D[t-12] / 12) / close[t-1] − 1.
+
+    Shiller D는 직선 보간이라 최근 값에 앞으로의 배당이 섞여 있어, 신호에는 12개월 전 D를 씁니다.
+    수익률 계산에는 쓰지 않습니다. 12개월 전 D가 있는 첫 달의 다음 달부터 값이 있습니다.
+    """
+    from src.monthly import total_return_signal_index
+
+    first_lagged = month_end["dividend"].first_valid_index() + 12
+    level = total_return_signal_index(month_end["close"].loc[first_lagged:].dropna(), month_end["dividend"], 12)
+    return (level / level.shift(1) - 1).rename("us_stock_sig_tr")
+
+
 def build_gtaa_monthly(
     month_end: pd.DataFrame, eafe: pd.Series, eafe_price: pd.Series, bond_yield: pd.Series,
     commodity_er: pd.Series, reits: dict[str, pd.DataFrame], current_month: pd.Period,
@@ -584,19 +604,13 @@ def build_gtaa_monthly(
     - reit_<이름>: NAREIT 지수들. 첫째가 기본입니다.
     current_month와 그 뒤는 끝나지 않은 달이라 뺍니다.
     """
-    from src.bonds import par_bond_monthly_returns
-    from src.monthly import total_return_signal_index
-
     bond = par_bond_monthly_returns(bond_yield)
     months = pd.period_range("1971-12", current_month - 1, freq="M", name="month")
     rf = month_end["rf"].reindex(months)
-    # 12개월 전 D가 있는 첫 달부터 신호용 지수를 만듭니다.
-    first_lagged = month_end["dividend"].first_valid_index() + 12
-    signal_level = total_return_signal_index(month_end["close"].loc[first_lagged:].dropna(), month_end["dividend"], 12)
     table = pd.DataFrame(index=months)
     table["us_stock_tr"] = month_end["total_return"].reindex(months)
     table["us_stock_pr"] = month_end["price_return"].reindex(months)
-    table["us_stock_sig_tr"] = (signal_level / signal_level.shift(1) - 1).reindex(months)
+    table["us_stock_sig_tr"] = sp500_signal_returns(month_end).reindex(months)
     table["eafe_tr"] = eafe.reindex(months)
     table["eafe_pr"] = eafe_price.reindex(months)
     table["bond_tr"] = bond["total_return"].reindex(months)
@@ -661,6 +675,80 @@ def main_gtaa(offline: bool = False) -> None:
         df.to_csv(DATA_DIR / name)
         print(f"저장: data/{name} ({df.index[0]} ~ {df.index[-1]}, {len(df)}행)")
     print("열마다 값이 있는 첫 달과 마지막 달:")
+    for column in table.columns:
+        valid = table[column].dropna()
+        print(f"  {column}: {valid.index[0]} ~ {valid.index[-1]}")
+
+
+def build_dual_momentum_monthly(
+    month_end: pd.DataFrame, ex_us: pd.Series, yield5: pd.Series, yield10: pd.Series, current_month: pd.Period,
+) -> pd.DataFrame:
+    """듀얼 모멘텀 근사 재현용 월간 표.
+
+    - us_stock_tr: S&P 500 월말 종가 + Shiller 배당. us_stock_sig_tr: 신호용(12개월 전 배당, sp500_signal_returns)
+    - ex_us_tr: 미국 외 주식 대체 자료 (Ken French 해외 지수 전체, EAFE + 캐나다 비중, 신흥국 없음)
+    - bond_tr: 5년 만기 국채 합성 (Barclays US Aggregate 대체), bond10_tr: 10년 만기 국채 합성 (참고)
+    - rf: Ken French RF
+    current_month와 그 뒤는 끝나지 않은 달이라 뺍니다.
+    """
+    months = pd.period_range("1971-12", current_month - 1, freq="M", name="month")
+    table = pd.DataFrame(index=months)
+    table["us_stock_tr"] = month_end["total_return"].reindex(months)
+    table["us_stock_sig_tr"] = sp500_signal_returns(month_end).reindex(months)
+    table["ex_us_tr"] = ex_us.reindex(months)
+    table["bond_tr"] = par_bond_monthly_returns(yield5, 5.0)["total_return"].reindex(months)
+    table["bond10_tr"] = par_bond_monthly_returns(yield10, 10.0)["total_return"].reindex(months)
+    table["rf"] = month_end["rf"].reindex(months)
+    return table
+
+
+def main_dual_momentum(offline: bool = False) -> None:
+    """듀얼 모멘텀 근사 재현용 표를 만듭니다.
+
+    S&P 500, 현금, H.15 금리, Ken French 해외 지수는 이미 받은 원본(main, main_gtaa)을 씁니다(다시 받지 않음).
+    교차 확인용 ETF(ACWX, AGG)만 새로 받습니다.
+    """
+    if not offline:
+        for symbol in YAHOO_DM_SYMBOLS:
+            download_yahoo(symbol)
+    h15_path = RAW_DIR / "fed_h15_cmt.csv"
+    manifest = json.loads(MANIFEST_PATH.read_text(encoding="utf-8"))
+    # 기준 시점은 H.15 원본을 내려받은 시각입니다 (main_gtaa와 같음).
+    now = datetime.fromisoformat(manifest[h15_path.name]["downloaded_at_utc"]).astimezone(US_MARKET_TZ)
+    current_month = current_us_month(now)
+    gspc_now = datetime.fromisoformat(manifest[YAHOO_SYMBOLS["^GSPC"]]["downloaded_at_utc"]).astimezone(US_MARKET_TZ)
+    shiller = parse_shiller(pd.read_excel(RAW_DIR / "shiller_ie_data.xls", sheet_name="Data", header=None))
+    gspc = parse_yahoo(json.loads((RAW_DIR / YAHOO_SYMBOLS["^GSPC"]).read_text(encoding="utf-8")))
+    rf = parse_french_rf(read_french_zip(RAW_DIR / "french_factors.zip"))
+    month_end = build_month_end(gspc[gspc.index.date < gspc_now.date()], shiller, rf, current_us_month(gspc_now))
+
+    h15 = h15_path.read_text(encoding="utf-8")
+    yields = {}
+    for key, identifier in [("5y", H15_5Y), ("10y", H15_10Y)]:
+        y = month_end_value(parse_h15_yield(h15, identifier))
+        yields[key] = y[y.index < current_month]
+        check_monthly_continuity(yields[key].index, f"H.15 {key} 금리")
+    ex_us = parse_french_international(read_french_dat(RAW_DIR / "french_international_indices.zip", "Ind_all.Dat"))
+    table = build_dual_momentum_monthly(month_end, ex_us, yields["5y"], yields["10y"], current_month)
+
+    check = {}
+    for symbol in YAHOO_DM_SYMBOLS:
+        price = month_end_value(parse_yahoo_adjclose(json.loads((RAW_DIR / YAHOO_DM_SYMBOLS[symbol]).read_text(encoding="utf-8"))))
+        price = price[price.index <= DM_CHECK_END]
+        check[f"{symbol.lower()}_tr"] = price / price.shift(1) - 1
+    check_table = pd.DataFrame(check)
+    check_table["ex_us_proxy_tr"] = table["ex_us_tr"].reindex(check_table.index)
+    check_table["bond_proxy_tr"] = table["bond_tr"].reindex(check_table.index)
+    # 채권 대체 자료의 만기를 바꿔 AGG와 비교하는 원인 확인용 (판단에 쓰지 않음)
+    for years, identifier in [(3, "RIFLGFCY03_N.B"), (7, "RIFLGFCY07_N.B"), (10, H15_10Y)]:
+        y = month_end_value(parse_h15_yield(h15, identifier))
+        y = y[y.index < current_month]
+        bond = par_bond_monthly_returns(y.loc["1990-01":], float(years))["total_return"]
+        check_table[f"bond{years}_proxy_tr"] = bond.reindex(check_table.index)
+
+    for name, df in {"dual_momentum_monthly.csv": table, "dual_momentum_check.csv": check_table}.items():
+        df.to_csv(DATA_DIR / name)
+        print(f"저장: data/{name} ({df.index[0]} ~ {df.index[-1]}, {len(df)}행)")
     for column in table.columns:
         valid = table[column].dropna()
         print(f"  {column}: {valid.index[0]} ~ {valid.index[-1]}")
@@ -788,8 +876,11 @@ if __name__ == "__main__":
     parser.add_argument("--kospi", action="store_true", help="KOSPI 실험용 표만 만듭니다")
     parser.add_argument("--inverse", action="store_true", help="인버스 ETF(SH, KODEX 인버스) 교차 확인용 표만 만듭니다")
     parser.add_argument("--gtaa", action="store_true", help="GTAA 근사 재현용 5자산 월간 표만 만듭니다")
+    parser.add_argument("--dual-momentum", action="store_true", help="듀얼 모멘텀 근사 재현용 월간 표만 만듭니다")
     args = parser.parse_args()
-    if args.gtaa:
+    if args.dual_momentum:
+        main_dual_momentum(offline=args.offline)
+    elif args.gtaa:
         main_gtaa(offline=args.offline)
     elif args.inverse:
         main_inverse(offline=args.offline)

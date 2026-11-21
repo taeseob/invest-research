@@ -135,9 +135,13 @@ def start_at_one(equity: pd.Series) -> pd.Series:
     return curve
 
 
-def _draw_equity(ax: plt.Axes, strategy: pd.Series, hold: pd.Series, strategy_label: str, height: float) -> None:
-    """자산 가치 칸. 두 곡선 끝에 최종값을 적고, 값이 가까우면 글자가 겹치지 않게 벌립니다."""
-    curves = [("단순 보유", hold, PRICE, "단순 보유 (같은 비용)"), ("전략", strategy, HOLDING, f"전략: {strategy_label}")]
+def _draw_equity(ax: plt.Axes, strategy: pd.Series, hold: pd.Series, strategy_label: str, height: float,
+                 strategy_color: str = HOLDING, hold_color: str = PRICE, hold_label: str = "단순 보유 (같은 비용)") -> None:
+    """자산 가치 칸. 두 곡선 끝에 최종값을 적고, 값이 가까우면 글자가 겹치지 않게 벌립니다.
+
+    위 칸에서 자산마다 범주색을 쓰는 차트는 색이 겹치지 않도록 strategy_color, hold_color를 넘깁니다.
+    """
+    curves = [("단순 보유", hold, hold_color, hold_label), ("전략", strategy, strategy_color, f"전략: {strategy_label}")]
     for _, curve, color, label in curves:
         ax.plot(curve.index, curve.to_numpy(), color=color, linewidth=1.4, solid_joinstyle="round", label=label)
         ax.plot(curve.index[-1], curve.iloc[-1], "o", markersize=5.5, color=color, markeredgecolor=SURFACE,
@@ -174,38 +178,54 @@ def portfolio_chart(
     subtitle: list[str],
     levels: dict[str, pd.Series],
     exposures: dict[str, pd.Series],
-    invested: pd.Series,
     equity: pd.Series,
     hold_equity: pd.Series,
     strategy_label: str,
+    invested: pd.Series | None = None,
+    indicators: dict[str, pd.Series] | None = None,
+    indicator_title: str = "",
+    bands_title: str = "보유 구간: 칠한 곳이 그 자산을 들고 있던 구간 (나머지는 그 몫을 현금으로)",
+    colors: dict[str, str] | None = None,
+    equity_colors: tuple[str, str] | None = None,
+    hold_label: str = "단순 보유 (같은 비용)",
 ) -> Path:
-    """자산마다 따로 판단하는 포트폴리오의 차트. 위에서 아래로 네 칸입니다.
+    """여러 자산을 오가는 포트폴리오의 차트. 위에서 아래로 칸이 이어집니다.
 
     1. 구성 자산 지수: 자산마다 색 하나, 시작일 = 1, 로그 눈금
     2. 보유 구간: 자산마다 한 줄, 같은 색. 칠한 곳이 그 자산을 들고 있던 구간입니다.
-    3. 투자 비율: 위험자산에 들어 있던 비율과 그 평균
-    4. 자산 가치: 전략과 단순 보유
-    exposures와 invested, equity, hold_equity는 같은 인덱스(첫 행은 시작일 = 기준일)여야 합니다. exposures의 의미는
+    3. (indicators를 넘기면) 보조지표: 이름이 자산과 같으면 그 자산 색, 아니면 무채색 점선(기준선)
+    4. (invested를 넘기면) 투자 비율: 위험자산에 들어 있던 비율과 그 평균
+    5. 자산 가치: 전략과 단순 보유
+    exposures, invested, equity, hold_equity는 같은 인덱스(첫 행은 시작일 = 기준일)여야 합니다. exposures의 의미는
     holding_spans와 같습니다. 자산 수는 CATEGORICAL 색 수 이하입니다.
+    colors: 자산 이름 → 색. 여러 차트에서 같은 자산이 같은 색이어야 할 때 넘깁니다(색은 순서가 아니라 대상을 따름).
+    넘기지 않으면 levels 순서대로 CATEGORICAL을 씁니다.
+    equity_colors: 자산 가치 칸의 (전략, 단순 보유) 색. 넘기지 않으면 다른 차트와 같은 관례(초록, 파랑)를 씁니다.
     """
     names = list(levels)
     if len(names) > len(CATEGORICAL) or list(exposures) != names:
         raise ValueError("자산 이름이 맞지 않거나 색이 모자랍니다.")
+    if colors is not None and not set(names) <= set(colors):
+        raise ValueError("colors에 없는 자산이 있습니다.")
     index = equity.index
-    for series in [invested, hold_equity, *exposures.values()]:
+    for series in [hold_equity, *exposures.values(), *([invested] if invested is not None else [])]:
         if not series.index.equals(index):
             raise ValueError("투자 비율, 자산 가치, 보유 상태의 날짜가 다릅니다.")
     first, last = index[0], index[-1]
-    colors = dict(zip(names, CATEGORICAL))
+    colors = {name: colors[name] for name in names} if colors is not None else dict(zip(names, CATEGORICAL))
 
     plt.rcParams.update({"font.family": _korean_font(), "axes.unicode_minus": False})
-    heights = [4.2, 0.42 * len(names) + 0.5, 1.6, 2.4]
+    kinds =["levels", "bands"] + (["indicator"] if indicators else []) + (["share"] if invested is not None else []) + ["equity"]
+    size = {"levels": 4.2, "bands": 0.42 * len(names) + 0.5, "indicator": 2.2, "share": 1.6, "equity": 2.4}
+    heights = [size[kind] for kind in kinds]
     header = 1.15 + 0.25 * len(subtitle)
     height = header + sum(heights) + 0.55
     fig, axes = plt.subplots(len(heights), 1, sharex=True, figsize=(14, height), facecolor=SURFACE,
                              gridspec_kw={"height_ratios": heights})
     # 보유 구간 띠의 자산 이름이 왼쪽에 들어가도록 왼쪽 여백을 holding_chart보다 넓게 둡니다.
-    fig.subplots_adjust(left=0.11, right=0.92, top=1 - header / height, bottom=0.5 / height, hspace=0.22)
+    # 보조지표 칸은 제목 아래에 범례를 두므로 칸 사이를 조금 넓힙니다.
+    fig.subplots_adjust(left=0.11, right=0.92, top=1 - header / height, bottom=0.5 / height,
+                        hspace=0.32 if indicators else 0.22)
     for ax in axes:
         _style(ax)
 
@@ -239,23 +259,41 @@ def portfolio_chart(
     bands.set_ylim(0, len(names))
     bands.set_yticks([len(names) - 1 - row + 0.5 for row in range(len(names))], names)
     bands.tick_params(axis="y", length=0, labelsize=9, labelcolor=INK_SECONDARY)
-    bands.set_title("보유 구간: 칠한 곳이 그 자산을 들고 있던 구간 (나머지는 그 몫을 현금으로)", loc="left", fontsize=10,
-                    color=INK, pad=5)
+    bands.set_title(bands_title, loc="left", fontsize=10, color=INK, pad=5)
 
-    # 3. 투자 비율
-    share = axes[2]
-    share.plot(invested.index, invested.to_numpy(), color=INK_SECONDARY, linewidth=1.0, drawstyle="steps-pre")
-    mean = invested.iloc[1:].mean()
-    # 평균선은 자산 색(범주색)과 겹치지 않게 무채색 점선으로 그립니다.
-    share.axhline(mean, color=INK_MUTED, linewidth=1.0, linestyle=(0, (4, 3)))
-    label_at = mtransforms.blended_transform_factory(share.transAxes, share.transData)
-    share.text(1.006, mean, f"평균 {mean:.0%}", transform=label_at, va="center", ha="left", fontsize=9, color=INK_SECONDARY)
-    share.set_ylim(-0.05, 1.05)
-    share.yaxis.set_major_formatter(FuncFormatter(lambda v, _: percent_label(v)))
-    share.set_title("투자 비율: 위험자산에 들어 있던 비율", loc="left", fontsize=10, color=INK, pad=5)
+    # 3. 보조지표
+    if indicators:
+        panel = axes[kinds.index("indicator")]
+        for name, series in indicators.items():
+            series = series[(series.index >= first) & (series.index <= last)]
+            if name in colors:
+                panel.plot(series.index, series.to_numpy(), color=colors[name], linewidth=1.1, label=name)
+            else:  # 기준선: 범주색과 겹치지 않게 무채색 점선
+                panel.plot(series.index, series.to_numpy(), color=INK_MUTED, linewidth=1.1, linestyle=(0, (4, 3)), label=name)
+        panel.axhline(0.0, color=AXIS, linewidth=0.8)
+        panel.yaxis.set_major_formatter(FuncFormatter(lambda v, _: percent_label(v)))
+        # 범례는 선을 가리지 않도록 칸 바깥 위(제목 아래)에 둡니다.
+        panel.set_title(indicator_title, loc="left", fontsize=10, color=INK, pad=22)
+        panel.legend(loc="lower left", bbox_to_anchor=(0, 1.0), borderaxespad=0.3, borderpad=0, frameon=False,
+                     fontsize=8.5, labelcolor=INK_SECONDARY, ncols=len(indicators), handletextpad=0.5, columnspacing=1.4)
 
-    # 4. 자산 가치
-    _draw_equity(axes[3], start_at_one(equity), start_at_one(hold_equity), strategy_label, heights[3])
+    # 4. 투자 비율
+    if invested is not None:
+        share = axes[kinds.index("share")]
+        share.plot(invested.index, invested.to_numpy(), color=INK_SECONDARY, linewidth=1.0, drawstyle="steps-pre")
+        mean = invested.iloc[1:].mean()
+        # 평균선은 자산 색(범주색)과 겹치지 않게 무채색 점선으로 그립니다.
+        share.axhline(mean, color=INK_MUTED, linewidth=1.0, linestyle=(0, (4, 3)))
+        label_at = mtransforms.blended_transform_factory(share.transAxes, share.transData)
+        share.text(1.006, mean, f"평균 {mean:.0%}", transform=label_at, va="center", ha="left", fontsize=9, color=INK_SECONDARY)
+        share.set_ylim(-0.05, 1.05)
+        share.yaxis.set_major_formatter(FuncFormatter(lambda v, _: percent_label(v)))
+        share.set_title("투자 비율: 위험자산에 들어 있던 비율", loc="left", fontsize=10, color=INK, pad=5)
+
+    # 5. 자산 가치
+    strategy_color, hold_color = equity_colors if equity_colors is not None else (HOLDING, PRICE)
+    _draw_equity(axes[-1], start_at_one(equity), start_at_one(hold_equity), strategy_label, heights[-1],
+                 strategy_color, hold_color, hold_label)
 
     years = (last - first).days / 365.25
     axes[-1].xaxis.set_major_locator(mdates.YearLocator(base=1 if years <= 10 else 2 if years <= 30 else 5))

@@ -2,7 +2,7 @@
 
 내려받은 시세 데이터를 두는 폴더입니다. 이 README를 빼고는 저장소에 올라가지 않습니다.
 
-데이터는 언제든 `src/`의 수집 코드로 다시 받을 수 있어야 합니다. 모두 `python -m src.data`로 만들고, 이미 받은 원본으로 표만 다시 만들 때는 `python -m src.data --offline`을 씁니다. KOSPI 표는 `python -m src.data --kospi`로 따로 만듭니다 (`--kospi --offline` 가능). 인버스 ETF 표는 `python -m src.data --inverse`로 따로 만듭니다 (`--inverse --offline` 가능, 현금 수익률은 이미 받은 Ken French·OECD 원본 사용). GTAA 근사 재현용 5자산 표는 `python -m src.data --gtaa`로 따로 만듭니다 (`--gtaa --offline` 가능, S&P 500과 현금은 이미 받은 ^GSPC·Shiller·Ken French 원본 사용).
+데이터는 언제든 `src/`의 수집 코드로 다시 받을 수 있어야 합니다. 모두 `python -m src.data`로 만들고, 이미 받은 원본으로 표만 다시 만들 때는 `python -m src.data --offline`을 씁니다. KOSPI 표는 `python -m src.data --kospi`로 따로 만듭니다 (`--kospi --offline` 가능). 인버스 ETF 표는 `python -m src.data --inverse`로 따로 만듭니다 (`--inverse --offline` 가능, 현금 수익률은 이미 받은 Ken French·OECD 원본 사용). GTAA 근사 재현용 5자산 표는 `python -m src.data --gtaa`로 따로 만듭니다 (`--gtaa --offline` 가능, S&P 500과 현금은 이미 받은 ^GSPC·Shiller·Ken French 원본 사용). 듀얼 모멘텀 근사 재현용 표는 `python -m src.data --dual-momentum`으로 만듭니다 (`--dual-momentum --offline` 가능, GTAA 때 받은 원본을 다시 쓰고 교차 확인용 ETF만 새로 받음).
 
 | 파일 | 내용 |
 |---|---|
@@ -33,6 +33,9 @@
 | `raw/yahoo_efa.json` | Yahoo EFA(iShares MSCI EAFE) 일별 시세 원본 (EAFE 대체 자료 교차 확인용) |
 | `gtaa_monthly.csv` | **GTAA 근사 재현용.** 자산마다 총수익률(`_tr`)과 신호용 가격 수익률(`_pr`), S&P 500 신호용 총수익률(`us_stock_sig_tr`, 12개월 전 배당), 10년 국채 월말 금리, 리츠 세 지수, RF |
 | `efa_monthly.csv` | EFA와 EAFE 대체 자료의 월 수익률 (2001-08 ~ 2012-12만. 교차 확인용) |
+| `raw/yahoo_acwx.json`, `raw/yahoo_agg.json` | Yahoo ACWX(iShares MSCI ACWI ex U.S.), AGG(iShares Core US Aggregate Bond) 일별 시세 원본 (듀얼 모멘텀 대체 자료 교차 확인용) |
+| `dual_momentum_monthly.csv` | **듀얼 모멘텀 근사 재현용.** S&P 500 총수익률과 신호용 총수익률(12개월 전 배당), 미국 외 주식 대체(Ken French 해외 지수 전체), 5년·10년 국채 합성, RF |
+| `dual_momentum_check.csv` | ACWX·AGG와 대체 자료의 월 수익률, 3·7·10년 국채 합성 (2003-09 ~ 2013-12만. 교차 확인용) |
 
 주의:
 
