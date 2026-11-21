@@ -254,7 +254,7 @@ def holding_chart(
         _draw_equity(axes[-1], start_at_one(equity), start_at_one(hold_equity), strategy_label, heights[-1])
 
     years = (last - first).days / 365.25
-    axes[-1].xaxis.set_major_locator(mdates.YearLocator(base=1 if years <= 10 else 2))
+    axes[-1].xaxis.set_major_locator(mdates.YearLocator(base=1 if years <= 10 else 2 if years <= 30 else 5))
     axes[-1].xaxis.set_minor_locator(mdates.YearLocator(base=1))
     axes[-1].xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
     axes[-1].set_xlim(first, last)

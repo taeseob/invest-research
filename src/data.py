@@ -51,7 +51,7 @@ YAHOO_INVERSE_SYMBOLS = {"SH": "yahoo_sh.json", "114800.KS": "yahoo_kodex_invers
 INVERSE_RANGE = {"SH": ("2006-06-21", "2012-12-31"), "114800.KS": ("2009-09-16", "2012-12-28")}
 # 가격의 호가 단위 (backtest.snap_to_tick에 씁니다).
 # SPY는 2001-01-26까지 1/64달러 단위, 그 뒤 센트 단위라 둘의 공배수인 1/1600달러를 씁니다. KOSPI 지수는 소수 둘째 자리입니다.
-PRICE_TICK = {"SPY": 1 / 1600, "^KS11": 0.01}
+PRICE_TICK = {"SPY": 1 / 1600, "^KS11": 0.01, "^GSPC": 0.01}
 
 US_MARKET_TZ = ZoneInfo("America/New_York")
 KR_MARKET_TZ = ZoneInfo("Asia/Seoul")
@@ -298,6 +298,18 @@ def daily_rf(index: pd.DatetimeIndex, rf_monthly: pd.Series, current_month: pd.P
     rf = (1 + rf_monthly.reindex(months).to_numpy()) ** (1 / days_in_month) - 1
     rf[months >= current_month] = float("nan")
     return pd.Series(rf, index=index, name="rf")
+
+
+def daily_dividend(index: pd.DatetimeIndex, annual_dividend: pd.Series) -> pd.Series:
+    """월간 연간 배당 D(Shiller, 지수 포인트, 인덱스는 월)를 그 달 거래일에 똑같이 나눈 일별 배당.
+
+    t월의 배당 D[t]/12를 그 달 거래일 수로 나눠 매일 받습니다. 거래일 수는 월말에야 알지만 매매 결정에는 쓰이지 않습니다.
+    D가 없는 달은 NaN입니다.
+    """
+    months = index.to_period("M")
+    days_in_month = pd.Series(1, index=index).groupby(months).transform("size").to_numpy()
+    dividend = annual_dividend.reindex(months).to_numpy() / 12 / days_in_month
+    return pd.Series(dividend, index=index, name="dividend")
 
 
 def build_etf_daily(close: pd.Series, dividends: pd.Series, rf_monthly: pd.Series, current_month: pd.Period) -> pd.DataFrame:
